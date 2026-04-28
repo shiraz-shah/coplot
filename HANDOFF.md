@@ -53,9 +53,10 @@ Core behavior working as of this handoff:
 - User and agent shell commands run with the project `.venv/bin` first on `PATH`.
 - The live Python session runs in project `.venv`, not in the coplot server interpreter.
 - `Clear All` clears `analysis.py`, chat, transcript, artifact ledger, generated artifact files, and recreates `.venv`.
-- New or modified PNG files in `plots/` created during live session execution are registered in `.agent-data/artifacts.jsonl`.
+- New or modified PNG files in `plots/` created during live session execution are registered or updated in `.agent-data/artifacts.jsonl`.
 - Plot artifacts render in the artifact pane.
 - Plot/image inspection prompts attach recent/pinned plot PNGs to the model request as `data:image/png;base64,...` image parts.
+- Session download exports `chat.jsonl`, `analysis.py`, and `plots/` as a zip.
 
 ## Persistence Files
 
@@ -139,7 +140,7 @@ The worker:
 - captures stdout/stderr
 - captures exceptions as stderr
 
-After each Python execution, the server records new or modified PNG files in `plots/` as plot artifacts.
+After each Python execution, the server records new or modified PNG files in `plots/` as plot artifacts. The ledger is folder-state oriented: a changed PNG path updates its existing artifact entry instead of accumulating duplicate entries.
 
 Shell commands run in project root with:
 

@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import base64
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -319,6 +320,42 @@ class ArtifactStore:
         entries = self.list()
         return max([int(entry["id"]) for entry in entries], default=0) + 1
 
+    def display_path(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(self.root))
+        except ValueError:
+            return str(path)
+
+    def upsert_path(
+        self,
+        *,
+        artifact_type: str,
+        path: Path,
+        source: str,
+        code: str,
+        caption: str,
+    ) -> dict[str, Any]:
+        display_path = self.display_path(path)
+        entries = self.list()
+        existing = next((entry for entry in entries if entry.get("path") == display_path), None)
+        updated = {
+            "id": int(existing["id"]) if existing else self.next_id(),
+            "type": artifact_type,
+            "path": display_path,
+            "created_at": utc_now_iso(),
+            "source": source,
+            "code": code,
+            "caption": caption,
+            "pinned": bool(existing.get("pinned")) if existing else False,
+        }
+        kept = [entry for entry in entries if entry.get("path") != display_path]
+        kept.append(updated)
+        self.path.write_text(
+            "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in kept),
+            encoding="utf-8",
+        )
+        return updated
+
     def append(
         self,
         *,
@@ -329,16 +366,12 @@ class ArtifactStore:
         caption: str,
         artifact_id: int | None = None,
     ) -> dict[str, Any]:
-        try:
-            display_path = str(path.resolve().relative_to(self.root))
-        except ValueError:
-            display_path = str(path)
         return append_jsonl(
             self.path,
             {
                 "id": artifact_id or self.next_id(),
                 "type": artifact_type,
-                "path": display_path,
+                "path": self.display_path(path),
                 "created_at": utc_now_iso(),
                 "source": source,
                 "code": code,
@@ -462,7 +495,7 @@ class PythonSession:
         generated = []
         for path in sorted(changed_paths):
             generated.append(
-                self.artifacts.append(
+                self.artifacts.upsert_path(
                     artifact_type="plot",
                     path=path,
                     source="session",
@@ -671,13 +704,8 @@ class AgentService:
         if not any(term in lowered for term in visual_terms):
             return []
         plots = [entry for entry in artifact_store.list() if entry.get("type") == "plot"]
-        pinned = [entry for entry in plots if entry.get("pinned")]
-        latest = plots[-1:] if plots else []
-        selected: list[dict[str, Any]] = []
-        for artifact in [*pinned, *latest]:
-            if artifact not in selected:
-                selected.append(artifact)
-        return selected[-4:]
+        plots.sort(key=lambda entry: (str(entry.get("created_at", "")), str(entry.get("path", ""))))
+        return plots[-1:] if plots else []
 
     def _artifact_data_url(self, artifact: dict[str, Any]) -> str | None:
         path_value = str(artifact.get("path", ""))
@@ -773,6 +801,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(self.state())
         if request_path == "/api/context":
             return self.send_json(context_builder.payload())
+        if request_path == "/api/download-session":
+            return self.download_session()
         if request_path.startswith("/plots/"):
             artifact_path = (project.root / request_path.lstrip("/")).resolve()
             if not artifact_path.is_relative_to(project.plots_dir.resolve()):
@@ -823,6 +853,27 @@ class Handler(SimpleHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def download_session(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            if project.chat_file.exists():
+                archive.write(project.chat_file, "chat.jsonl")
+            if project.source_file.exists():
+                archive.write(project.source_file, project.source_file.name)
+            if project.plots_dir.exists():
+                archive.writestr("plots/", "")
+                for path in sorted(project.plots_dir.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.resolve().relative_to(project.root.resolve()))
+        data = buffer.getvalue()
+        filename = f"coplot-session-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

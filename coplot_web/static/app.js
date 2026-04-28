@@ -1,16 +1,22 @@
 const state = {
   data: null,
   mode: "session",
-  artifactIndex: 0,
-  viewedArtifactCount: 0,
-  artifactNavigationPinned: false,
   pendingEditorSelection: null,
+  chatPending: false,
+  pendingChatMessage: "",
+  terminalPending: null,
+  fullscreenArtifactIndex: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
 
 function setStatus(text) {
   $("#status").textContent = text;
+}
+
+function syncPendingControls() {
+  $("#chat-input").disabled = state.chatPending;
+  $("#command-input").disabled = Boolean(state.terminalPending);
 }
 
 async function api(path, options = {}) {
@@ -41,6 +47,7 @@ function render(options = {}) {
   renderTranscript(data.transcript);
   renderArtifacts(data.artifacts);
   renderModelSettings(data.model_settings);
+  syncPendingControls();
   setStatus("Ready");
   applyPendingEditorSelection();
 }
@@ -48,7 +55,7 @@ function render(options = {}) {
 function renderChat(entries) {
   const log = $("#chat-log");
   log.innerHTML = "";
-  if (!entries.length) {
+  if (!entries.length && !state.chatPending && !state.pendingChatMessage) {
     log.innerHTML = '<div class="empty">No chat yet.</div>';
     return;
   }
@@ -62,13 +69,41 @@ function renderChat(entries) {
     `;
     log.appendChild(item);
   }
+  if (state.pendingChatMessage) {
+    log.appendChild(renderPendingUserMessage(state.pendingChatMessage));
+  }
+  if (state.chatPending) {
+    log.appendChild(renderTypingMessage());
+  }
   log.scrollTop = log.scrollHeight;
+}
+
+function renderPendingUserMessage(content) {
+  const item = document.createElement("div");
+  item.className = "message user pending-user-message";
+  item.innerHTML = `
+    <div class="label">user</div>
+    <div class="content">${formatMarkdownLite(content)}</div>
+  `;
+  return item;
+}
+
+function renderTypingMessage() {
+  const item = document.createElement("div");
+  item.className = "message assistant pending-message";
+  item.innerHTML = `
+    <div class="label">assistant</div>
+    <div class="typing-dots" aria-label="Assistant is thinking">
+      <span></span><span></span><span></span>
+    </div>
+  `;
+  return item;
 }
 
 function renderTranscript(entries) {
   const transcript = $("#transcript");
   transcript.innerHTML = "";
-  if (!entries.length) {
+  if (!entries.length && !state.terminalPending) {
     transcript.innerHTML = '<div class="empty">Run durable code, session snippets, or shell commands to create transcript entries.</div>';
     return;
   }
@@ -88,40 +123,49 @@ function renderTranscript(entries) {
     `;
     transcript.appendChild(item);
   }
+  if (state.terminalPending) {
+    transcript.appendChild(renderPendingTranscriptEntry(state.terminalPending));
+  }
   transcript.scrollTop = transcript.scrollHeight;
 }
 
+function renderPendingTranscriptEntry(pending) {
+  const item = document.createElement("div");
+  item.className = "entry pending-entry";
+  const languageClass = pending.kind === "shell" ? "shell-entry" : "session-entry";
+  item.innerHTML = `
+    <div class="label">${escapeHtml(pending.kind)} · ${escapeHtml(pending.source)} · <span class="running">running</span></div>
+    <pre class="transcript-input ${languageClass}">${escapeHtml(pending.input)}</pre>
+    <div class="running-dots" aria-label="Command is running"><span></span><span></span><span></span></div>
+  `;
+  return item;
+}
+
 function renderArtifacts(artifacts) {
-  const plots = artifacts.filter((artifact) => artifact.type === "plot");
+  const plots = sortedPlotArtifacts(artifacts);
   $("#artifact-count").textContent = `${plots.length} plot${plots.length === 1 ? "" : "s"}`;
   if (!plots.length) {
     $("#artifact-view").innerHTML = '<div class="empty">No plot artifacts yet.</div>';
-    $("#pin-artifact").disabled = true;
-    state.viewedArtifactCount = 0;
-    state.artifactNavigationPinned = false;
     return;
   }
-  if (!state.artifactNavigationPinned || plots.length > state.viewedArtifactCount) {
-    state.artifactIndex = plots.length - 1;
-    state.artifactNavigationPinned = false;
-  }
-  state.viewedArtifactCount = plots.length;
-  state.artifactIndex = Math.max(0, Math.min(state.artifactIndex, plots.length - 1));
-  const artifact = plots[state.artifactIndex];
+  const artifact = plots[plots.length - 1];
   $("#artifact-view").innerHTML = `
     <img alt="${escapeHtml(artifact.caption)}" src="/${encodeURI(artifact.path)}?v=${encodeURIComponent(artifact.created_at)}" />
     <div class="artifact-meta-overlay">${formatArtifactMeta(artifact)}</div>
   `;
-  $("#artifact-view img").addEventListener("click", () => openArtifactFullscreen(artifact));
-  $("#pin-artifact").disabled = false;
-  $("#pin-artifact").textContent = artifact.pinned ? "◇" : "◆";
-  $("#pin-artifact").title = artifact.pinned ? "Unpin artifact" : "Pin artifact";
-  $("#pin-artifact").setAttribute("aria-label", artifact.pinned ? "Unpin artifact" : "Pin artifact");
+  $("#artifact-view img").addEventListener("click", () => openArtifactFullscreen(plots.length - 1));
 }
 
-function currentPlot() {
-  const plots = state.data.artifacts.filter((artifact) => artifact.type === "plot");
-  return plots[state.artifactIndex];
+function sortedPlotArtifacts(artifacts) {
+  return artifacts
+    .filter((artifact) => artifact.type === "plot")
+    .slice()
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.created_at || "") || 0;
+      const rightTime = Date.parse(right.created_at || "") || 0;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return String(left.path || "").localeCompare(String(right.path || ""));
+    });
 }
 
 function renderModelSettings(settings) {
@@ -209,14 +253,39 @@ function findEditorSelection(actions = []) {
   return null;
 }
 
-async function postAndRefresh(path, body) {
+function renderPendingState() {
+  if (!state.data) return;
+  syncPendingControls();
+  renderChat(state.data.chat);
+  renderTranscript(state.data.transcript);
+}
+
+async function postAndRefresh(path, body, options = {}) {
   setStatus("Working");
-  const payload = await api(path, { method: "POST", body: JSON.stringify(body) });
-  state.data = payload.state || state.data;
-  const actions = payload.result?.actions || [];
-  state.pendingEditorSelection = findEditorSelection(actions);
-  render({ forceSource: Boolean(state.pendingEditorSelection) });
-  return payload;
+  state.chatPending = Boolean(options.chatPending);
+  state.pendingChatMessage = options.pendingChatMessage || "";
+  state.terminalPending = options.terminalPending || null;
+  renderPendingState();
+  try {
+    const payload = await api(path, { method: "POST", body: JSON.stringify(body) });
+    state.data = payload.state || state.data;
+    const actions = payload.result?.actions || [];
+    state.pendingEditorSelection = findEditorSelection(actions);
+    state.chatPending = false;
+    state.pendingChatMessage = "";
+    state.terminalPending = null;
+    syncPendingControls();
+    render({ forceSource: Boolean(state.pendingEditorSelection) });
+    return payload;
+  } catch (error) {
+    state.chatPending = false;
+    state.pendingChatMessage = "";
+    state.terminalPending = null;
+    syncPendingControls();
+    renderPendingState();
+    setStatus(error.message);
+    throw error;
+  }
 }
 
 function selectedEditorCode() {
@@ -228,7 +297,11 @@ function selectedEditorCode() {
 async function runSelectedEditorCode() {
   const code = selectedEditorCode();
   if (!code.trim()) return;
-  await postAndRefresh("/api/run-session", { code, source: "user_executed" });
+  await postAndRefresh(
+    "/api/run-session",
+    { code, source: "user_executed" },
+    { terminalPending: { kind: "session", source: "user_executed", input: code } },
+  );
 }
 
 function updateSourceHighlight() {
@@ -277,10 +350,22 @@ function placeholderIndex(key) {
   return value - 1;
 }
 
-function openArtifactFullscreen(artifact) {
+function fullscreenPlots() {
+  return state.data ? sortedPlotArtifacts(state.data.artifacts) : [];
+}
+
+function showFullscreenArtifact(index) {
+  const plots = fullscreenPlots();
+  if (!plots.length) return;
+  state.fullscreenArtifactIndex = (index + plots.length) % plots.length;
+  const artifact = plots[state.fullscreenArtifactIndex];
   const image = $("#fullscreen-artifact-image");
   image.src = `/${encodeURI(artifact.path)}?v=${encodeURIComponent(artifact.created_at)}`;
   image.alt = artifact.caption || "Plot artifact";
+}
+
+function openArtifactFullscreen(index) {
+  showFullscreenArtifact(index);
   $("#artifact-fullscreen").showModal();
 }
 
@@ -289,15 +374,19 @@ $("#save-source").addEventListener("click", async () => {
 });
 
 $("#run-file").addEventListener("click", async () => {
-  await postAndRefresh("/api/run-file", { source: $("#source-editor").value });
+  const source = $("#source-editor").value;
+  await postAndRefresh(
+    "/api/run-file",
+    { source },
+    { terminalPending: { kind: "session", source: "durable_script", input: source } },
+  );
 });
 
 $("#mode-session").addEventListener("click", () => {
   state.mode = "session";
   $("#mode-session").classList.add("active");
   $("#mode-shell").classList.remove("active");
-  $("#session-title").textContent = "Python";
-  $("#session-mode-label").textContent = "";
+  $("#session-title").textContent = "Python session";
   $("#command-input").placeholder = "print(df.head())";
   $("#command-form").classList.add("session-command");
   $("#command-form").classList.remove("shell-command");
@@ -309,8 +398,7 @@ $("#mode-shell").addEventListener("click", () => {
   state.mode = "shell";
   $("#mode-shell").classList.add("active");
   $("#mode-session").classList.remove("active");
-  $("#session-title").textContent = "Shell";
-  $("#session-mode-label").textContent = "";
+  $("#session-title").textContent = "Shell command";
   $("#command-input").placeholder = "python3 -m pip install pandas";
   $("#command-form").classList.add("shell-command");
   $("#command-form").classList.remove("session-command");
@@ -322,13 +410,22 @@ $("#clear-session").addEventListener("click", async () => {
   await postAndRefresh("/api/clear-session", {});
 });
 
+$("#download-session").addEventListener("click", () => {
+  window.location.href = "/api/download-session";
+});
+
 $("#command-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("#command-input").value.trim();
   if (!input) return;
   const path = state.mode === "session" ? "/api/run-session" : "/api/run-shell";
   const body = state.mode === "session" ? { code: input } : { command: input };
-  await postAndRefresh(path, body);
+  const pending = {
+    kind: state.mode === "session" ? "session" : "shell",
+    source: state.mode === "session" ? "user_executed" : "user_shell",
+    input,
+  };
+  await postAndRefresh(path, body, { terminalPending: pending });
   $("#command-input").value = "";
 });
 
@@ -343,8 +440,8 @@ $("#chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("#chat-input").value.trim();
   if (!input) return;
-  await postAndRefresh("/api/chat", { message: input });
   $("#chat-input").value = "";
+  await postAndRefresh("/api/chat", { message: input }, { chatPending: true, pendingChatMessage: input });
 });
 
 $("#source-editor").addEventListener("input", updateSourceHighlight);
@@ -363,6 +460,18 @@ $("#chat-input").addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("keydown", async (event) => {
+  if ($("#artifact-fullscreen").open && event.key === "ArrowLeft") {
+    event.preventDefault();
+    showFullscreenArtifact((state.fullscreenArtifactIndex ?? 0) - 1);
+    return;
+  }
+
+  if ($("#artifact-fullscreen").open && event.key === "ArrowRight") {
+    event.preventDefault();
+    showFullscreenArtifact((state.fullscreenArtifactIndex ?? 0) + 1);
+    return;
+  }
+
   const commandOrControl = event.metaKey || event.ctrlKey;
   if (!commandOrControl) return;
 
@@ -375,6 +484,7 @@ document.addEventListener("keydown", async (event) => {
     event.preventDefault();
     $("#command-input").focus();
   }
+
 });
 
 $("#open-model-settings").addEventListener("click", () => {
@@ -392,24 +502,6 @@ $("#model-settings-form").addEventListener("submit", async (event) => {
   $("#model-settings-dialog").close();
 });
 
-$("#prev-artifact").addEventListener("click", () => {
-  state.artifactIndex -= 1;
-  state.artifactNavigationPinned = true;
-  renderArtifacts(state.data.artifacts);
-});
-
-$("#next-artifact").addEventListener("click", () => {
-  state.artifactIndex += 1;
-  state.artifactNavigationPinned = true;
-  renderArtifacts(state.data.artifacts);
-});
-
-$("#pin-artifact").addEventListener("click", async () => {
-  const artifact = currentPlot();
-  if (!artifact) return;
-  await postAndRefresh("/api/artifact-pin", { id: artifact.id, pinned: !artifact.pinned });
-});
-
 $("#refresh-context").addEventListener("click", async () => {
   const payload = await api("/api/context");
   $("#context-payload").textContent = JSON.stringify(payload, null, 2);
@@ -420,14 +512,9 @@ $("#close-context").addEventListener("click", () => {
   $("#context-dialog").close();
 });
 
-$("#close-artifact-fullscreen").addEventListener("click", () => {
-  $("#artifact-fullscreen").close();
-});
-
 $("#artifact-fullscreen").addEventListener("click", (event) => {
-  if (event.target === $("#artifact-fullscreen")) {
-    $("#artifact-fullscreen").close();
-  }
+  $("#artifact-fullscreen").close();
+  state.fullscreenArtifactIndex = null;
 });
 
 refresh().catch((error) => {
@@ -436,5 +523,4 @@ refresh().catch((error) => {
 
 $("#command-form").classList.add("session-command");
 $(".session-pane").classList.add("python-mode");
-$("#session-title").textContent = "Python";
-$("#session-mode-label").textContent = "";
+$("#session-title").textContent = "Python session";

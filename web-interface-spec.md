@@ -463,7 +463,7 @@ Python MVP behavior:
 
 - The model should save plots explicitly as PNG files in `plots/`.
 - After Python execution, detect new or modified PNG files in `plots/`.
-- Append artifact ledger entries for changed PNGs.
+- Upsert artifact ledger entries for changed PNGs so each plot path appears once.
 
 The web app should additionally:
 

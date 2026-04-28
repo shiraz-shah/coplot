@@ -53,13 +53,11 @@
       <section class="pane session-pane">
         <div class="pane-header">
           <div>
-            <strong id="session-title">Python</strong>
-            <span id="session-mode-label"></span>
+            <strong id="session-title">Python session</strong>
           </div>
           <div class="segmented">
-            <button id="mode-session" class="active" type="button" title="Session" aria-label="Session">λ</button>
+            <button id="mode-session" class="active" type="button" title="Python session" aria-label="Python session">py</button>
             <button id="mode-shell" type="button" title="Shell" aria-label="Shell">$</button>
-            <button id="clear-session" type="button" title="Clear all" aria-label="Clear all">×</button>
           </div>
         </div>
         <div id="transcript" class="scroll transcript"></div>
@@ -75,9 +73,8 @@
             <span id="artifact-count">0 plots</span>
           </div>
           <div class="actions">
-            <button id="prev-artifact" type="button" title="Previous artifact" aria-label="Previous artifact">‹</button>
-            <button id="next-artifact" type="button" title="Next artifact" aria-label="Next artifact">›</button>
-            <button id="pin-artifact" type="button" title="Pin artifact" aria-label="Pin artifact">◆</button>
+            <button id="download-session" type="button" title="Download session" aria-label="Download session">⬇</button>
+            <button id="clear-session" type="button" title="Clear all" aria-label="Clear all">×</button>
           </div>
         </div>
         <div id="artifact-view" class="artifact-view"></div>
@@ -139,7 +136,6 @@
     </dialog>
 
     <dialog id="artifact-fullscreen" class="fullscreen-dialog">
-      <button id="close-artifact-fullscreen" type="button" title="Close plot preview" aria-label="Close plot preview">×</button>
       <img id="fullscreen-artifact-image" alt="" />
     </dialog>
 

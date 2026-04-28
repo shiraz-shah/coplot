@@ -32,7 +32,9 @@ On another machine on the same LAN, replace `localhost` with the machine's local
 - `web-interface-spec.md` captures the product direction.
 - `HANDOFF.md` captures the current implementation state and known rough edges.
 
-PNG files created or modified in `plots/` by executed Python code are registered as plot artifacts and shown in the artifact pane.
+PNG files created or modified in `plots/` by executed Python code are registered or updated as plot artifacts and shown in the artifact pane.
+
+The session download action exports a zip containing `chat.jsonl`, `analysis.py`, and `plots/`.
 
 ## Local State
 
