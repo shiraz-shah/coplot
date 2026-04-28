@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>coplot</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <strong>coplot</strong>
+        <span id="project-root"></span>
+      </div>
+      <div class="status" id="status">Starting</div>
+    </header>
+
+    <main class="workspace">
+      <section class="pane editor-pane">
+        <div class="pane-header">
+          <div>
+            <strong id="source-name">analysis.py</strong>
+            <span>durable code</span>
+          </div>
+          <div class="actions">
+            <button id="save-source" type="button" title="Save" aria-label="Save">⇣</button>
+            <button id="run-file" type="button" title="Run file" aria-label="Run file">▶</button>
+          </div>
+        </div>
+        <div class="editor-shell">
+          <pre id="source-highlight" aria-hidden="true"></pre>
+          <textarea id="source-editor" spellcheck="false" aria-label="Durable code editor"></textarea>
+        </div>
+      </section>
+
+      <section class="pane chat-pane">
+        <div class="pane-header">
+          <div>
+            <strong>Chat</strong>
+            <span>assistant conversation</span>
+          </div>
+          <div class="actions">
+            <button id="open-model-settings" type="button" title="Model settings" aria-label="Model settings">⚙</button>
+            <button id="refresh-context" type="button" title="Context" aria-label="Context">◧</button>
+          </div>
+        </div>
+        <div id="chat-log" class="scroll"></div>
+        <form id="chat-form" class="composer">
+          <textarea id="chat-input" rows="1" placeholder="Ask about the code, session, outputs, or latest plot"></textarea>
+        </form>
+      </section>
+
+      <section class="pane session-pane">
+        <div class="pane-header">
+          <div>
+            <strong id="session-title">Python</strong>
+            <span id="session-mode-label"></span>
+          </div>
+          <div class="segmented">
+            <button id="mode-session" class="active" type="button" title="Session" aria-label="Session">λ</button>
+            <button id="mode-shell" type="button" title="Shell" aria-label="Shell">$</button>
+            <button id="clear-session" type="button" title="Clear all" aria-label="Clear all">×</button>
+          </div>
+        </div>
+        <div id="transcript" class="scroll transcript"></div>
+        <form id="command-form" class="command-row">
+          <textarea id="command-input" rows="1" spellcheck="false" placeholder="print(df.head())"></textarea>
+        </form>
+      </section>
+
+      <section class="pane artifact-pane">
+        <div class="pane-header">
+          <div>
+            <strong>Artifacts</strong>
+            <span id="artifact-count">0 plots</span>
+          </div>
+          <div class="actions">
+            <button id="prev-artifact" type="button" title="Previous artifact" aria-label="Previous artifact">‹</button>
+            <button id="next-artifact" type="button" title="Next artifact" aria-label="Next artifact">›</button>
+            <button id="pin-artifact" type="button" title="Pin artifact" aria-label="Pin artifact">◆</button>
+          </div>
+        </div>
+        <div id="artifact-view" class="artifact-view"></div>
+      </section>
+    </main>
+
+    <dialog id="context-dialog">
+      <div class="dialog-header">
+        <strong>Next Model Context</strong>
+        <button id="close-context" type="button" title="Close" aria-label="Close">×</button>
+      </div>
+      <pre id="context-payload"></pre>
+    </dialog>
+
+    <dialog id="model-settings-dialog">
+      <form id="model-settings-form" class="settings-form">
+        <div class="dialog-header">
+          <strong>Chat Settings</strong>
+          <button id="close-model-settings" type="button" title="Close" aria-label="Close">×</button>
+        </div>
+        <div class="settings-grid">
+          <label>
+            Endpoint URL
+            <input id="setting-endpoint-url" name="endpoint_url" type="text" required />
+          </label>
+          <label>
+            Model
+            <input id="setting-model" name="model" type="text" required />
+          </label>
+          <label>
+            Max tokens
+            <input id="setting-max-tokens" name="max_tokens" type="number" min="1" step="1" />
+          </label>
+          <label>
+            Temperature
+            <input id="setting-temperature" name="temperature" type="number" min="0" max="2" step="0.1" />
+          </label>
+          <label>
+            Timeout seconds
+            <input id="setting-timeout" name="timeout_seconds" type="number" min="1" step="1" />
+          </label>
+          <label>
+            Reasoning effort
+            <select id="setting-reasoning-effort" name="reasoning_effort">
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+          <label class="toggle-row">
+            <input id="setting-reasoning-enabled" name="reasoning_enabled" type="checkbox" />
+            Enable model thinking
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button type="submit" title="Save settings" aria-label="Save settings">✓</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="artifact-fullscreen" class="fullscreen-dialog">
+      <button id="close-artifact-fullscreen" type="button" title="Close plot preview" aria-label="Close plot preview">×</button>
+      <img id="fullscreen-artifact-image" alt="" />
+    </dialog>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

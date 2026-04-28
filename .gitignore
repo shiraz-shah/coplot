@@ -1,0 +1,26 @@
+# Local coplot workspace state
+.agent-data/
+artifacts/
+analysis.py
+
+# Local analysis environments and Python caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Historical prototype/reference material
+reference/
+
+# Generated analysis outputs
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
