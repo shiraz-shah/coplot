@@ -25,10 +25,10 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 EDIT_BLOCK_RE = re.compile(r"```coplot-edit[ \t]*\n(?P<json>.*?)```", re.DOTALL | re.IGNORECASE)
 RUN_BLOCK_RE = re.compile(r"```coplot-run[ \t]*\n(?P<code>.*?)```", re.DOTALL | re.IGNORECASE)
 SHELL_BLOCK_RE = re.compile(r"```coplot-shell[ \t]*\n(?P<command>.*?)```", re.DOTALL | re.IGNORECASE)
-
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -114,7 +114,7 @@ def selection_for_line_edits(source: str, edits: list[dict[str, Any]]) -> dict[s
     if not start_offsets:
         return None
     start = min(start_offsets)
-    end = max(offset + length for offset, length in zip(start_offsets, replacement_lengths, strict=True))
+    end = max(offset + length for offset, length in zip(start_offsets, replacement_lengths))
     if end <= start:
         return None
     return {"start": start, "end": end}
@@ -132,13 +132,11 @@ class ProjectState:
     model_settings_file: Path
     venv_dir: Path
     venv_python: Path
-    artifacts_dir: Path
     plots_dir: Path
 
     @classmethod
     def discover(cls, root: Path) -> "ProjectState":
         agent_data_dir = root / ".agent-data"
-        artifacts_dir = root / "artifacts"
         return cls(
             root=root,
             source_file=root / "analysis.py",
@@ -147,11 +145,10 @@ class ProjectState:
             chat_file=agent_data_dir / "chat.jsonl",
             transcript_file=agent_data_dir / "transcript.jsonl",
             artifacts_file=agent_data_dir / "artifacts.jsonl",
-            model_settings_file=agent_data_dir / "model-settings.json",
+            model_settings_file=CONFIG_FILE,
             venv_dir=root / ".venv",
             venv_python=root / ".venv" / "bin" / "python",
-            artifacts_dir=artifacts_dir,
-            plots_dir=artifacts_dir / "plots",
+            plots_dir=root / "plots",
         )
 
     def ensure(self) -> None:
@@ -163,11 +160,6 @@ class ProjectState:
         self.chat_file.touch(exist_ok=True)
         self.transcript_file.touch(exist_ok=True)
         self.artifacts_file.touch(exist_ok=True)
-        if not self.model_settings_file.exists():
-            self.model_settings_file.write_text(
-                json.dumps(default_model_settings(), indent=2) + "\n",
-                encoding="utf-8",
-            )
         self.ensure_venv()
 
     def ensure_venv(self) -> None:
@@ -214,6 +206,7 @@ class ModelSettingsStore:
         current["temperature"] = float(current["temperature"])
         current["reasoning_enabled"] = bool(current["reasoning_enabled"])
         current["timeout_seconds"] = max(1, int(current["timeout_seconds"]))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return current
 
@@ -425,14 +418,14 @@ class PythonSession:
 
     def execute(self, code: str, *, source: str, interactive: bool = False) -> dict[str, Any]:
         start = time.perf_counter()
+        before_pngs = self._png_snapshot()
         response = self._send_worker_request(
             {
                 "code": code,
                 "interactive": interactive,
-                "artifact_start_id": self.artifacts.next_id(),
             }
         )
-        generated_artifacts = self._record_worker_artifacts(response.get("artifacts", []), code)
+        generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
         duration_ms = int((time.perf_counter() - start) * 1000)
         entry = self.transcript.append_session(
             language="python",
@@ -446,6 +439,39 @@ class PythonSession:
         )
         return {"entry": entry, "artifacts": generated_artifacts}
 
+    def _png_snapshot(self) -> dict[Path, tuple[int, int]]:
+        snapshot: dict[Path, tuple[int, int]] = {}
+        root = self.project.plots_dir.resolve()
+        if not root.exists():
+            return snapshot
+        for path in root.rglob("*"):
+            if path.suffix.lower() != ".png" or not path.is_file():
+                continue
+            resolved = path.resolve()
+            stat = resolved.stat()
+            snapshot[resolved] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
+
+    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]], code: str) -> list[dict[str, Any]]:
+        after = self._png_snapshot()
+        changed_paths = [
+            path
+            for path, signature in after.items()
+            if before.get(path) != signature
+        ]
+        generated = []
+        for path in sorted(changed_paths):
+            generated.append(
+                self.artifacts.append(
+                    artifact_type="plot",
+                    path=path,
+                    source="session",
+                    code=code,
+                    caption=path.name,
+                )
+            )
+        return generated
+
     def _send_worker_request(self, request: dict[str, Any]) -> dict[str, Any]:
         process = self._ensure_worker()
         if process.stdin is None or process.stdout is None:
@@ -458,22 +484,6 @@ class PythonSession:
             self.process = None
             return {"stdout": "", "stderr": f"Python session worker stopped.\n{stderr}", "ok": False, "artifacts": []}
         return json.loads(line)
-
-    def _record_worker_artifacts(self, artifacts: list[dict[str, Any]], code: str) -> list[dict[str, Any]]:
-        generated = []
-        for artifact in artifacts:
-            generated.append(
-                self.artifacts.append(
-                    artifact_type="plot",
-                    path=Path(str(artifact["path"])),
-                    source="session",
-                    code=code,
-                    caption=str(artifact.get("caption", "Matplotlib figure")),
-                    artifact_id=int(artifact["id"]),
-                )
-            )
-        return generated
-
 
 class ShellSession:
     def __init__(self, project: ProjectState, transcript: TranscriptStore, cwd: Path) -> None:
@@ -594,7 +604,11 @@ class AgentService:
             "Use durable edits for reproducible work, session runs for scratch Python, and shell "
             "commands for package or system checks. The Python session and shell both use the "
             "project .venv; install Python packages with python -m pip install ... so they land "
-            "in that environment. If plot images are attached to the user message, inspect the "
+            "in that environment. The user will often ask you to visually inspect plots for "
+            "feedback. You can only see plots if they have been saved as PNG files in the "
+            "./plots/ folder. Therefore, always save plots as PNG files in ./plots/. Calling "
+            "plt.show() may show a plot to the user in their local environment, but it does "
+            "not make the plot visible to you. If plot images are attached to the user message, inspect the "
             "image directly instead of saying you cannot see it.\n\n"
             f"Context payload:\n{json.dumps(context, ensure_ascii=False)}"
         )
@@ -670,7 +684,7 @@ class AgentService:
         if not path_value:
             return None
         path = (self.project.root / path_value).resolve()
-        if not path.is_file() or not path.is_relative_to(self.project.artifacts_dir.resolve()):
+        if not path.is_file() or not path.is_relative_to(self.project.plots_dir.resolve()):
             return None
         mime_type = "image/png" if path.suffix.lower() == ".png" else "application/octet-stream"
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -759,9 +773,9 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(self.state())
         if request_path == "/api/context":
             return self.send_json(context_builder.payload())
-        if request_path.startswith("/artifacts/"):
+        if request_path.startswith("/plots/"):
             artifact_path = (project.root / request_path.lstrip("/")).resolve()
-            if not artifact_path.is_relative_to(project.artifacts_dir.resolve()):
+            if not artifact_path.is_relative_to(project.plots_dir.resolve()):
                 return self.send_error(HTTPStatus.FORBIDDEN)
             return self.serve_file(artifact_path)
         return super().do_GET()
@@ -822,6 +836,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "shell": "command-by-command",
                 "venv": str(project.venv_dir),
                 "python": str(project.venv_python),
+                "model_settings_file": str(model_settings_store.path),
             },
             "source": project.source_file.read_text(encoding="utf-8"),
             "chat": chat_store.recent(100),
@@ -856,8 +871,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"result": {"ok": True, "message": "Workspace cleared."}, "state": self.state()})
 
     def clear_artifact_files(self) -> None:
-        root = project.artifacts_dir.resolve()
-        for path in project.artifacts_dir.rglob("*"):
+        root = project.plots_dir.resolve()
+        for path in project.plots_dir.rglob("*"):
             resolved = path.resolve()
             if not resolved.is_relative_to(root) or not path.is_file():
                 continue

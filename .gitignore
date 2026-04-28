@@ -1,7 +1,8 @@
 # Local coplot workspace state
 .agent-data/
-artifacts/
+plots/
 analysis.py
+coplot_web/config.json
 
 # Local analysis environments and Python caches
 .venv/

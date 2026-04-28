@@ -32,14 +32,18 @@ On another machine on the same LAN, replace `localhost` with the machine's local
 - `web-interface-spec.md` captures the product direction.
 - `HANDOFF.md` captures the current implementation state and known rough edges.
 
+PNG files created or modified in `plots/` by executed Python code are registered as plot artifacts and shown in the artifact pane.
+
 ## Local State
 
 The app creates local workspace files that are intentionally not committed:
 
 - `.venv/`
 - `.agent-data/`
-- `artifacts/`
+- `plots/`
 - `analysis.py`
 - generated plot/image files
 
 This keeps GitHub focused on the coplot application source rather than one machine's current analysis session.
+
+Model settings are application config, not session state. coplot reads and writes them at `coplot_web/config.json`. That file is intentionally ignored by Git because it contains local endpoint/model preferences.

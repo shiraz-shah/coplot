@@ -24,7 +24,7 @@ Current coplot prototype files and behavior:
 - `.agent-data/transcript.jsonl` stores executed code and outputs.
 - `.agent-data/artifacts.jsonl` stores artifact metadata.
 - `.agent-data/summary.md` is intended as compact restartable session state.
-- `artifacts/plots/` stores generated PNG plots.
+- `plots/` stores generated PNG plots.
 - `PythonSession` executes code in a persistent in-process Python namespace.
 - `TranscriptEntry.source` currently distinguishes:
   - `durable_script`: full editor/run-file execution.
@@ -136,8 +136,8 @@ R fallback:
 
 Project setup should be explicit but simple:
 
-- New Python project: create project folder, create `.venv`, create `analysis.py`, create `.agent-data/`, create `artifacts/`.
-- New R project: create project folder, initialize `renv` if selected, create `analysis.R`, create `.agent-data/`, create `artifacts/`.
+- New Python project: create project folder, create `.venv`, create `analysis.py`, create `.agent-data/`, create `plots/`.
+- New R project: create project folder, initialize `renv` if selected, create `analysis.R`, create `.agent-data/`, create `plots/`.
 - Existing Python project: detect `.venv`, interpreter, and dependency files; offer to create `.venv` if missing.
 - Existing R project: detect `renv`; offer to initialize `renv` if missing; otherwise use the user's local R library as fallback.
 
@@ -459,12 +459,11 @@ Keep compatibility readers for the existing `code` field if importing old protot
 
 ## Plot Capture
 
-Python MVP behavior can mirror the current prototype:
+Python MVP behavior:
 
-- After Python execution, detect open matplotlib figures.
-- Save each figure to `artifacts/plots/{id:03d}_figure_{n}.png`.
-- Append artifact ledger entries.
-- Close figures after saving to prevent duplicate capture.
+- The model should save plots explicitly as PNG files in `plots/`.
+- After Python execution, detect new or modified PNG files in `plots/`.
+- Append artifact ledger entries for changed PNGs.
 
 The web app should additionally:
 

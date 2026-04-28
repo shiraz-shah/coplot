@@ -53,7 +53,7 @@ Core behavior working as of this handoff:
 - User and agent shell commands run with the project `.venv/bin` first on `PATH`.
 - The live Python session runs in project `.venv`, not in the coplot server interpreter.
 - `Clear All` clears `analysis.py`, chat, transcript, artifact ledger, generated artifact files, and recreates `.venv`.
-- Matplotlib figures created in the live session are saved to `artifacts/plots/` and registered in `.agent-data/artifacts.jsonl`.
+- New or modified PNG files in `plots/` created during live session execution are registered in `.agent-data/artifacts.jsonl`.
 - Plot artifacts render in the artifact pane.
 - Plot/image inspection prompts attach recent/pinned plot PNGs to the model request as `data:image/png;base64,...` image parts.
 
@@ -67,14 +67,12 @@ coplot writes:
   transcript.jsonl
   artifacts.jsonl
   summary.md
-  model-settings.json
-artifacts/
-  plots/
+plots/
 analysis.py
 .venv/
 ```
 
-`model-settings.json` persists the chat endpoint config and is intentionally not cleared by `Clear All`.
+`coplot_web/config.json` persists the chat endpoint config as application config, not session state, and is intentionally not cleared by `Clear All`. The file is ignored by Git because it contains local endpoint/model preferences.
 
 Current defaults:
 
@@ -130,7 +128,7 @@ Shell execution is currently command-by-command, not a persistent PTY.
 The server process is not the analysis Python environment. `server.py` launches `session_worker.py` using:
 
 ```text
-.venv/bin/python -u coplot_web/session_worker.py --plots-dir artifacts/plots
+.venv/bin/python -u coplot_web/session_worker.py --plots-dir plots
 ```
 
 The worker:
@@ -140,8 +138,8 @@ The worker:
 - writes JSON responses over stdout
 - captures stdout/stderr
 - captures exceptions as stderr
-- saves open matplotlib figures to `artifacts/plots/{id:03d}_figure_{n}.png`
-- closes figures after saving
+
+After each Python execution, the server records new or modified PNG files in `plots/` as plot artifacts.
 
 Shell commands run in project root with:
 
@@ -159,11 +157,11 @@ Artifact ledger entries look like:
 {
   "id": 1,
   "type": "plot",
-  "path": "artifacts/plots/001_figure_1.png",
+  "path": "plots/example.png",
   "created_at": "...",
   "source": "session",
   "code": "...",
-  "caption": "Matplotlib figure 1",
+  "caption": "example.png",
   "pinned": false
 }
 ```
@@ -209,7 +207,7 @@ Potential core bugfix areas:
 - Shell timeout is fixed at 120 seconds.
 - Package installs can exceed 120 seconds on slow networks.
 - `Clear All` recreates `.venv`, which can take several seconds and currently has no progress UI.
-- Artifact capture only catches open matplotlib figures; explicit `plt.savefig("foo.png")` outside `artifacts/plots/` is not automatically ledgered unless a figure remains open.
+- Only PNG files saved in `plots/` are registered for display and multimodal inspection.
 - Chat calls are non-streaming and can block the request thread.
 - The current multimodal heuristic is simple keyword matching.
 
