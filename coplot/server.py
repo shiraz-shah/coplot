@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import argparse
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import base64
 import zipfile
 from dataclasses import asdict, dataclass
@@ -26,10 +28,22 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
+DEFAULTS_FILE = Path(os.environ.get("COPLOT_DEFAULTS_FILE", Path.home() / ".config" / "coplot" / "defaults.json"))
 EDIT_BLOCK_RE = re.compile(r"```coplot-edit[ \t]*\n(?P<json>.*?)```", re.DOTALL | re.IGNORECASE)
 RUN_BLOCK_RE = re.compile(r"```coplot-run[ \t]*\n(?P<code>.*?)```", re.DOTALL | re.IGNORECASE)
 SHELL_BLOCK_RE = re.compile(r"```coplot-shell[ \t]*\n(?P<command>.*?)```", re.DOTALL | re.IGNORECASE)
+
+project: "ProjectState"
+chat_store: "ChatStore"
+transcript_store: "TranscriptStore"
+artifact_store: "ArtifactStore"
+model_settings_store: "ModelSettingsStore"
+python_session: "PythonSession"
+shell_session: "ShellSession"
+context_builder: "ContextBuilder"
+agent_service: "AgentService"
+workspace_first_run = False
+stop_requested = False
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -137,7 +151,8 @@ class ProjectState:
 
     @classmethod
     def discover(cls, root: Path) -> "ProjectState":
-        agent_data_dir = root / ".agent-data"
+        root = root.expanduser().resolve()
+        agent_data_dir = root / "coplot_data"
         return cls(
             root=root,
             source_file=root / "analysis.py",
@@ -146,13 +161,14 @@ class ProjectState:
             chat_file=agent_data_dir / "chat.jsonl",
             transcript_file=agent_data_dir / "transcript.jsonl",
             artifacts_file=agent_data_dir / "artifacts.jsonl",
-            model_settings_file=CONFIG_FILE,
-            venv_dir=root / ".venv",
-            venv_python=root / ".venv" / "bin" / "python",
+            model_settings_file=agent_data_dir / "config.json",
+            venv_dir=root / "venv",
+            venv_python=root / "venv" / "bin" / "python",
             plots_dir=root / "plots",
         )
 
     def ensure(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
         self.agent_data_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
         self.source_file.touch(exist_ok=True)
@@ -176,39 +192,70 @@ class ProjectState:
 
 def default_model_settings() -> dict[str, Any]:
     return {
-        "endpoint_url": "localhost:8000",
-        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "endpoint_url": "http://localhost:11434",
+        "model": "qwen3.5:2b",
         "max_tokens": 8192,
         "temperature": 0.2,
         "reasoning_enabled": False,
-        "reasoning_effort": "medium",
-        "timeout_seconds": 1800,
+        "reasoning_control": "auto",
+        "context_window_tokens": 32768,
+        "timeout_seconds": 600,
     }
 
 
 class ModelSettingsStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, defaults_path: Path) -> None:
         self.path = path
+        self.defaults_path = defaults_path
 
     def read(self) -> dict[str, Any]:
         settings = default_model_settings()
+        if self.defaults_path.exists():
+            stored_defaults = json.loads(self.defaults_path.read_text(encoding="utf-8") or "{}")
+            settings.update({key: value for key, value in stored_defaults.items() if value is not None})
         if self.path.exists():
             stored = json.loads(self.path.read_text(encoding="utf-8") or "{}")
             settings.update({key: value for key, value in stored.items() if value is not None})
+        settings.pop("reasoning_effort", None)
         return settings
 
     def write(self, values: dict[str, Any]) -> dict[str, Any]:
-        current = self.read()
-        allowed = set(default_model_settings())
+        current = default_model_settings()
+        if self.path.exists():
+            stored = json.loads(self.path.read_text(encoding="utf-8") or "{}")
+            current.update({key: value for key, value in stored.items() if value is not None})
+        current = self._clean({**current, **values})
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return self.read()
+
+    def write_defaults(self, values: dict[str, Any]) -> dict[str, Any]:
+        current = default_model_settings()
+        if self.defaults_path.exists():
+            stored = json.loads(self.defaults_path.read_text(encoding="utf-8") or "{}")
+            current.update({key: value for key, value in stored.items() if value is not None})
+        current = self._clean({**current, **values})
+        self.defaults_path.parent.mkdir(parents=True, exist_ok=True)
+        self.defaults_path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return current
+
+    def ensure_workspace_config(self) -> None:
+        if self.path.exists():
+            return
+        self.write(self.read())
+
+    def _clean(self, values: dict[str, Any]) -> dict[str, Any]:
+        current = default_model_settings()
+        allowed = set(current)
         for key, value in values.items():
             if key in allowed:
                 current[key] = value
         current["max_tokens"] = max(1, int(current["max_tokens"]))
         current["temperature"] = float(current["temperature"])
         current["reasoning_enabled"] = bool(current["reasoning_enabled"])
+        current["reasoning_control"] = str(current.get("reasoning_control") or "auto")
+        current["context_window_tokens"] = max(1, int(current["context_window_tokens"]))
         current["timeout_seconds"] = max(1, int(current["timeout_seconds"]))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return current
 
     def request_url(self) -> str:
@@ -220,6 +267,117 @@ class ModelSettingsStore:
         if endpoint.endswith("/v1"):
             return f"{endpoint}/chat/completions"
         return f"{endpoint}/v1/chat/completions"
+
+    def models_url(self, endpoint_url: str | None = None) -> str:
+        endpoint = str(endpoint_url or self.read()["endpoint_url"]).rstrip("/")
+        if "://" not in endpoint:
+            endpoint = f"http://{endpoint}"
+        if endpoint.endswith("/chat/completions"):
+            endpoint = endpoint[: -len("/chat/completions")]
+        if endpoint.endswith("/v1"):
+            return f"{endpoint}/models"
+        return f"{endpoint}/v1/models"
+
+
+def normalize_endpoint_url(endpoint_url: str) -> str:
+    endpoint = endpoint_url.strip().rstrip("/")
+    if "://" not in endpoint:
+        endpoint = f"http://{endpoint}"
+    return endpoint
+
+
+def detect_reasoning_control_from_endpoint(endpoint_url: str) -> str:
+    parsed = urllib.parse.urlparse(normalize_endpoint_url(endpoint_url))
+    host = parsed.hostname or ""
+    if parsed.port == 11434 or host.endswith(".ollama"):
+        return "ollama"
+    return "chat_template_kwargs"
+
+
+def detect_reasoning_control(endpoint_url: str, models: list[dict[str, Any]]) -> str:
+    endpoint_guess = detect_reasoning_control_from_endpoint(endpoint_url)
+    owners = {str(model.get("owned_by", "")).lower() for model in models}
+    if "vllm" in owners:
+        return "chat_template_kwargs"
+    if "library" in owners:
+        return "ollama"
+    return endpoint_guess
+
+
+def resolve_reasoning_control(settings: dict[str, Any]) -> str:
+    control = str(settings.get("reasoning_control") or "auto")
+    if control == "auto":
+        return detect_reasoning_control_from_endpoint(str(settings.get("endpoint_url", "")))
+    if control in {"ollama", "chat_template_kwargs", "none"}:
+        return control
+    return "chat_template_kwargs"
+
+
+def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
+    url = model_settings_store.models_url(endpoint_url)
+    request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    models = data.get("data", [])
+    if not isinstance(models, list):
+        models = []
+    normalized = [
+        {
+            "id": str(model.get("id") or model.get("name") or model.get("model") or ""),
+            "owned_by": str(model.get("owned_by") or ""),
+            "context_window_tokens": model.get("max_model_len") or model.get("context_length"),
+        }
+        for model in models
+        if model.get("id") or model.get("name") or model.get("model")
+    ]
+    reasoning_control = detect_reasoning_control(endpoint_url, normalized)
+    if reasoning_control == "ollama":
+        merge_ollama_loaded_context(endpoint_url, normalized, timeout=timeout)
+    return {
+        "models": normalized,
+        "reasoning_control": reasoning_control,
+    }
+
+
+def merge_ollama_loaded_context(endpoint_url: str, models: list[dict[str, Any]], timeout: int = 10) -> None:
+    endpoint = normalize_endpoint_url(endpoint_url)
+    parsed = urllib.parse.urlparse(endpoint)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    url = f"{base}/api/ps"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return
+    loaded = data.get("models", [])
+    if not isinstance(loaded, list):
+        return
+    context_by_name = {
+        str(model.get("model") or model.get("name") or ""): model.get("context_length")
+        for model in loaded
+        if model.get("context_length")
+    }
+    for model in models:
+        context_length = context_by_name.get(str(model.get("id", "")))
+        if context_length:
+            model["context_window_tokens"] = context_length
+
+
+def estimate_tokens(value: Any) -> int:
+    text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    return max(1, int(len(text) / 4))
+
+
+def context_token_breakdown(payload: dict[str, Any]) -> dict[str, int]:
+    return {
+        "durable_code": estimate_tokens(payload.get("durable_code", "")),
+        "session_summary": estimate_tokens(payload.get("session_summary", "")),
+        "recent_chat": estimate_tokens(payload.get("recent_chat", [])),
+        "recent_transcript": estimate_tokens(payload.get("recent_transcript", [])),
+        "artifacts": estimate_tokens(payload.get("artifacts", {})),
+        "environment": estimate_tokens(payload.get("environment", {})),
+    }
 
 
 class ChatStore:
@@ -428,7 +586,7 @@ class PythonSession:
             [
                 str(self.project.venv_python),
                 "-u",
-                str(ROOT / "coplot_web" / "session_worker.py"),
+                str(Path(__file__).resolve().parent / "session_worker.py"),
                 "--plots-dir",
                 str(self.plots_dir),
             ],
@@ -585,7 +743,7 @@ class ContextBuilder:
                 "language": "python",
                 "python_executable": str(self.project.venv_python),
                 "python_venv": str(self.project.venv_dir),
-                "package_install_hint": "Use python -m pip install ... or pip install ...; shell PATH points at the project .venv.",
+                "package_install_hint": "Use python -m pip install ... or pip install ...; shell PATH points at the project venv.",
             },
         }
 
@@ -608,7 +766,28 @@ class AgentService:
         self.settings = settings
 
     def respond(self, message: str) -> dict[str, Any]:
+        global stop_requested
+        stop_requested = False
         self.chat.append("user", message)
+        actions: list[dict[str, Any]] = []
+        assistant = self._request_and_apply(message, action_feedback="")
+        pending_actions = assistant["actions"]
+        actions.extend(pending_actions)
+        followup_count = 0
+        while self._actions_need_followup(pending_actions) and followup_count < 3 and not stop_requested:
+            followup_count += 1
+            feedback = self._action_feedback(pending_actions)
+            assistant = self._request_and_apply(
+                "Continue from the executed action results. If no more action is needed, answer the user.",
+                action_feedback=feedback,
+            )
+            pending_actions = assistant["actions"]
+            actions.extend(pending_actions)
+        if stop_requested:
+            self.chat.append("system", "Agent stopped by user.")
+        return {"message": assistant["message"], "actions": actions, "stopped": stop_requested}
+
+    def _request_and_apply(self, message: str, *, action_feedback: str) -> dict[str, Any]:
         settings = self.settings.read()
         model = str(settings["model"]).strip()
         if not model:
@@ -617,6 +796,8 @@ class AgentService:
             return {"message": assistant, "actions": []}
 
         context = self.context_builder.payload(message)
+        if action_feedback:
+            context["action_feedback"] = action_feedback
         prompt = (
             "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
             "session scratch work, shell commands, and artifacts clearly separated.\n\n"
@@ -636,7 +817,7 @@ class AgentService:
             "```\n"
             "Use durable edits for reproducible work, session runs for scratch Python, and shell "
             "commands for package or system checks. The Python session and shell both use the "
-            "project .venv; install Python packages with python -m pip install ... so they land "
+            "project venv; install Python packages with python -m pip install ... so they land "
             "in that environment. The user will often ask you to visually inspect plots for "
             "feedback. You can only see plots if they have been saved as PNG files in the "
             "./plots/ folder. Therefore, always save plots as PNG files in ./plots/. Calling "
@@ -655,10 +836,8 @@ class AgentService:
             "max_tokens": int(settings["max_tokens"]),
             "temperature": float(settings["temperature"]),
             "stream": False,
-            "chat_template_kwargs": {"enable_thinking": bool(settings["reasoning_enabled"])},
         }
-        if settings["reasoning_enabled"]:
-            payload["reasoning"] = {"effort": str(settings["reasoning_effort"])}
+        self._apply_reasoning_settings(payload, settings)
         request = urllib.request.Request(
             self.settings.request_url(),
             data=json.dumps(payload).encode("utf-8"),
@@ -675,6 +854,45 @@ class AgentService:
         assistant = self.chat.append("assistant", content)
         actions = self._run_actions(content)
         return {"message": assistant, "actions": actions}
+
+    def _actions_need_followup(self, actions: list[dict[str, Any]]) -> bool:
+        if not actions:
+            return False
+        recent = actions[-6:]
+        return any(action.get("type") in {"execute_session", "execute_shell"} for action in recent)
+
+    def _action_feedback(self, actions: list[dict[str, Any]]) -> str:
+        chunks = []
+        for action in actions[-6:]:
+            if action.get("type") not in {"execute_session", "execute_shell"}:
+                continue
+            result = action.get("result", {})
+            entry = result.get("entry", result)
+            chunks.append(
+                json.dumps(
+                    {
+                        "type": action.get("type"),
+                        "ok": entry.get("ok"),
+                        "stdout": entry.get("stdout", ""),
+                        "stderr": entry.get("stderr", ""),
+                        "artifacts": result.get("artifacts", []),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return "\n".join(chunks)
+
+    def _apply_reasoning_settings(self, payload: dict[str, Any], settings: dict[str, Any]) -> None:
+        control = resolve_reasoning_control(settings)
+        reasoning_enabled = bool(settings["reasoning_enabled"])
+        if control == "none":
+            return
+        if control == "ollama":
+            if not reasoning_enabled:
+                payload["reasoning_effort"] = "none"
+            return
+        if control == "chat_template_kwargs":
+            payload["chat_template_kwargs"] = {"enable_thinking": reasoning_enabled}
 
     def _user_content(self, message: str) -> str | list[dict[str, Any]]:
         artifacts = self._image_artifacts_for_message(message)
@@ -768,23 +986,37 @@ class AgentService:
         return actions
 
 
-project = ProjectState.discover(ROOT)
-project.ensure()
-chat_store = ChatStore(project.chat_file)
-transcript_store = TranscriptStore(project.transcript_file)
-artifact_store = ArtifactStore(project.artifacts_file, project.root)
-model_settings_store = ModelSettingsStore(project.model_settings_file)
-python_session = PythonSession(project, transcript_store, artifact_store, project.plots_dir)
-shell_session = ShellSession(project, transcript_store, project.root)
-context_builder = ContextBuilder(project, chat_store, transcript_store, artifact_store)
-agent_service = AgentService(
-    project,
-    chat_store,
-    context_builder,
-    python_session,
-    shell_session,
-    model_settings_store,
-)
+def configure_app(workspace_root: Path) -> None:
+    global project
+    global chat_store
+    global transcript_store
+    global artifact_store
+    global model_settings_store
+    global python_session
+    global shell_session
+    global context_builder
+    global agent_service
+    global workspace_first_run
+
+    project = ProjectState.discover(workspace_root)
+    workspace_first_run = not project.model_settings_file.exists()
+    project.ensure()
+    chat_store = ChatStore(project.chat_file)
+    transcript_store = TranscriptStore(project.transcript_file)
+    artifact_store = ArtifactStore(project.artifacts_file, project.root)
+    model_settings_store = ModelSettingsStore(project.model_settings_file, DEFAULTS_FILE)
+    model_settings_store.ensure_workspace_config()
+    python_session = PythonSession(project, transcript_store, artifact_store, project.plots_dir)
+    shell_session = ShellSession(project, transcript_store, project.root)
+    context_builder = ContextBuilder(project, chat_store, transcript_store, artifact_store)
+    agent_service = AgentService(
+        project,
+        chat_store,
+        context_builder,
+        python_session,
+        shell_session,
+        model_settings_store,
+    )
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -818,7 +1050,12 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/clear-session": self.clear_session,
             "/api/run-shell": self.run_shell,
             "/api/chat": self.chat,
+            "/api/stop": self.stop_agent,
+            "/api/clear-context": self.clear_context,
             "/api/model-settings": self.save_model_settings,
+            "/api/model-settings-defaults": self.save_model_settings_defaults,
+            "/api/model-settings-proceed": self.proceed_model_settings,
+            "/api/model-endpoint": self.model_endpoint,
             "/api/artifact-pin": self.pin_artifact,
         }
         handler = routes.get(self.path)
@@ -879,6 +1116,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def state(self) -> dict[str, Any]:
+        context_payload = context_builder.payload()
+        estimated_context_tokens = estimate_tokens(context_payload)
+        context_breakdown = context_token_breakdown(context_payload)
+        context_window_tokens = int(model_settings_store.read().get("context_window_tokens", 32768))
         return {
             "project": {
                 "root": str(project.root),
@@ -888,12 +1129,20 @@ class Handler(SimpleHTTPRequestHandler):
                 "venv": str(project.venv_dir),
                 "python": str(project.venv_python),
                 "model_settings_file": str(model_settings_store.path),
+                "defaults_file": str(model_settings_store.defaults_path),
+                "first_run": workspace_first_run,
             },
             "source": project.source_file.read_text(encoding="utf-8"),
             "chat": chat_store.recent(100),
             "transcript": transcript_store.recent(100),
             "artifacts": artifact_store.list(),
             "model_settings": model_settings_store.read(),
+            "context_usage": {
+                "estimated_tokens": estimated_context_tokens,
+                "limit_tokens": context_window_tokens,
+                "percent": min(100, round((estimated_context_tokens / context_window_tokens) * 100)),
+                "breakdown": context_breakdown,
+            },
         }
 
     def save_source(self, body: dict[str, Any]) -> None:
@@ -921,6 +1170,12 @@ class Handler(SimpleHTTPRequestHandler):
         project.recreate_venv()
         self.send_json({"result": {"ok": True, "message": "Workspace cleared."}, "state": self.state()})
 
+    def clear_context(self, body: dict[str, Any]) -> None:
+        project.chat_file.write_text("", encoding="utf-8")
+        project.transcript_file.write_text("", encoding="utf-8")
+        project.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
+        self.send_json({"result": {"ok": True, "message": "Context cleared."}, "state": self.state()})
+
     def clear_artifact_files(self) -> None:
         root = project.plots_dir.resolve()
         for path in project.plots_dir.rglob("*"):
@@ -938,22 +1193,73 @@ class Handler(SimpleHTTPRequestHandler):
         result = agent_service.respond(str(body.get("message", "")))
         self.send_json({"result": result, "state": self.state()})
 
+    def stop_agent(self, body: dict[str, Any]) -> None:
+        global stop_requested
+        stop_requested = True
+        self.send_json({"result": {"ok": True, "message": "Stop requested."}, "state": self.state()})
+
     def save_model_settings(self, body: dict[str, Any]) -> None:
         settings = model_settings_store.write(body)
         self.send_json({"model_settings": settings, "state": self.state()})
+
+    def save_model_settings_defaults(self, body: dict[str, Any]) -> None:
+        settings = model_settings_store.write_defaults(body)
+        self.send_json({"model_settings": settings, "state": self.state()})
+
+    def proceed_model_settings(self, body: dict[str, Any]) -> None:
+        global workspace_first_run
+        settings = model_settings_store.write(body)
+        workspace_first_run = False
+        self.send_json({"model_settings": settings, "state": self.state()})
+
+    def model_endpoint(self, body: dict[str, Any]) -> None:
+        endpoint_url = str(body.get("endpoint_url", ""))
+        if not endpoint_url.strip():
+            return self.send_json({"error": "Endpoint URL is empty."}, status=400)
+        try:
+            result = fetch_models(endpoint_url)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return self.send_json({"error": f"Could not connect to model endpoint: {exc}"}, status=400)
+        self.send_json(result)
 
     def pin_artifact(self, body: dict[str, Any]) -> None:
         updated = artifact_store.set_pinned(int(body["id"]), bool(body.get("pinned", True)))
         self.send_json({"artifact": updated, "state": self.state()})
 
 
-def main() -> None:
-    host = os.environ.get("COPLOT_HOST", "0.0.0.0")
-    port = int(os.environ.get("COPLOT_PORT", "8765"))
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="coplot",
+        description="Start a local coplot workspace.",
+    )
+    parser.add_argument(
+        "workspace",
+        nargs="?",
+        default=".",
+        help="Folder containing the data and analysis workspace.",
+    )
+    parser.add_argument("--host", default=os.environ.get("COPLOT_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("COPLOT_PORT", "8765")))
+    parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_app(Path(args.workspace))
+    host = args.host
+    port = args.port
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"coplot web interface: http://{host}:{port}", flush=True)
+    display_host = "localhost" if host in {"0.0.0.0", "::"} else host
+    url = f"http://{display_host}:{port}"
+    print(f"coplot web interface: {url}", flush=True)
     print(f"Project root: {project.root}", flush=True)
-    server.serve_forever()
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    finally:
+        python_session.stop()
 
 
 if __name__ == "__main__":

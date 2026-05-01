@@ -23,13 +23,15 @@
             <span>durable code</span>
           </div>
           <div class="actions">
-            <button id="save-source" type="button" title="Save" aria-label="Save">⇣</button>
+            <button id="save-source" type="button" title="Save analysis.py" aria-label="Save analysis.py">⇣</button>
+            <button id="run-selected" type="button" title="Run selected (Cmd/Ctrl+Enter)" aria-label="Run selected">▸</button>
             <button id="run-file" type="button" title="Run file" aria-label="Run file">▶</button>
           </div>
         </div>
         <div class="editor-shell">
           <pre id="source-highlight" aria-hidden="true"></pre>
-          <textarea id="source-editor" spellcheck="false" aria-label="Durable code editor"></textarea>
+          <div id="current-line-highlight" aria-hidden="true"></div>
+          <textarea id="source-editor" spellcheck="false" wrap="off" aria-label="Durable code editor"></textarea>
         </div>
       </section>
 
@@ -37,16 +39,17 @@
         <div class="pane-header">
           <div>
             <strong>Chat</strong>
-            <span>assistant conversation</span>
+            <span id="context-meter">context --</span>
           </div>
           <div class="actions">
-            <button id="open-model-settings" type="button" title="Model settings" aria-label="Model settings">⚙</button>
-            <button id="refresh-context" type="button" title="Context" aria-label="Context">◧</button>
+            <button id="open-model-settings" type="button" title="Settings" aria-label="Settings">⚙</button>
+            <button id="clear-context" type="button" title="Clear chat and execution context" aria-label="Clear context">◧</button>
           </div>
         </div>
         <div id="chat-log" class="scroll"></div>
         <form id="chat-form" class="composer">
           <textarea id="chat-input" rows="1" placeholder="Ask about the code, session, outputs, or latest plot"></textarea>
+          <button id="stop-agent" type="button" title="Stop after the current action" aria-label="Stop after the current action" hidden>■</button>
         </form>
       </section>
 
@@ -57,7 +60,7 @@
           </div>
           <div class="segmented">
             <button id="mode-session" class="active" type="button" title="Python session" aria-label="Python session">py</button>
-            <button id="mode-shell" type="button" title="Shell" aria-label="Shell">$</button>
+            <button id="mode-shell" type="button" title="Shell command" aria-label="Shell command">$</button>
           </div>
         </div>
         <div id="transcript" class="scroll transcript"></div>
@@ -73,8 +76,8 @@
             <span id="artifact-count">0 plots</span>
           </div>
           <div class="actions">
-            <button id="download-session" type="button" title="Download session" aria-label="Download session">⬇</button>
-            <button id="clear-session" type="button" title="Clear all" aria-label="Clear all">×</button>
+            <button id="download-session" type="button" title="Download workspace session" aria-label="Download workspace session">⬇</button>
+            <button id="clear-session" type="button" title="Clear workspace session" aria-label="Clear workspace session">×</button>
           </div>
         </div>
         <div id="artifact-view" class="artifact-view"></div>
@@ -92,21 +95,28 @@
     <dialog id="model-settings-dialog">
       <form id="model-settings-form" class="settings-form">
         <div class="dialog-header">
-          <strong>Chat Settings</strong>
+          <strong id="settings-title">Chat Settings</strong>
           <button id="close-model-settings" type="button" title="Close" aria-label="Close">×</button>
         </div>
         <div class="settings-grid">
-          <label>
-            Endpoint URL
-            <input id="setting-endpoint-url" name="endpoint_url" type="text" required />
-          </label>
+          <div class="setting-with-action">
+            <label>
+              Endpoint URL
+              <input id="setting-endpoint-url" name="endpoint_url" type="text" required />
+            </label>
+            <button id="connect-model-endpoint" type="button" title="Connect and load available models" aria-label="Connect and load available models">Connect</button>
+          </div>
           <label>
             Model
-            <input id="setting-model" name="model" type="text" required />
+            <select id="setting-model" name="model" required></select>
           </label>
           <label>
             Max tokens
             <input id="setting-max-tokens" name="max_tokens" type="number" min="1" step="1" />
+          </label>
+          <label>
+            Context window
+            <input id="setting-context-window" name="context_window_tokens" type="number" min="1" step="1" />
           </label>
           <label>
             Temperature
@@ -116,21 +126,16 @@
             Timeout seconds
             <input id="setting-timeout" name="timeout_seconds" type="number" min="1" step="1" />
           </label>
-          <label>
-            Reasoning effort
-            <select id="setting-reasoning-effort" name="reasoning_effort">
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-            </select>
-          </label>
           <label class="toggle-row">
             <input id="setting-reasoning-enabled" name="reasoning_enabled" type="checkbox" />
             Enable model thinking
           </label>
+          <input id="setting-reasoning-control" name="reasoning_control" type="hidden" />
         </div>
+        <div id="settings-message" class="settings-message"></div>
         <div class="dialog-actions">
-          <button type="submit" title="Save settings" aria-label="Save settings">✓</button>
+          <button id="save-model-defaults" type="button" title="Save these as defaults for future workspaces" aria-label="Save defaults">Save</button>
+          <button id="proceed-model-settings" type="submit" title="Save these settings for this workspace and enter coplot" aria-label="Proceed">Proceed</button>
         </div>
       </form>
     </dialog>

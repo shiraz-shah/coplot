@@ -284,6 +284,24 @@ dialog::backdrop {
   gap: 5px;
 }
 
+.setting-with-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.setting-with-action label {
+  min-width: 0;
+}
+
+.setting-with-action button,
+.dialog-actions button {
+  min-width: 76px;
+  padding: 0 12px;
+  color: var(--accent);
+}
+
 .toggle-row {
   align-items: center;
   flex-direction: row !important;
@@ -298,9 +316,20 @@ dialog::backdrop {
 .dialog-actions {
   margin-top: auto;
   display: flex;
+  gap: 8px;
   justify-content: flex-end;
   padding: 10px 14px;
   border-top: 1px solid var(--line);
+}
+
+.settings-message {
+  min-height: 22px;
+  padding: 0 14px 10px;
+  color: var(--muted);
+}
+
+.settings-message.error {
+  color: var(--bad);
 }
 
 @media (max-width: 820px) {
@@ -494,7 +523,18 @@ textarea:disabled {
   overflow: auto;
   white-space: pre;
   tab-size: 4;
-  font: 13px/1.55 "SFMono-Regular", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+  font-family: "SFMono-Regular", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+#current-line-highlight {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: rgb(54 241 209 / 0.14);
 }
 
 #source-editor {
@@ -544,7 +584,10 @@ textarea:disabled {
 }
 
 .composer {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 1px;
   padding: 0;
   border-top: 0;
   background: transparent;
@@ -558,6 +601,17 @@ textarea:disabled {
   background: #232a39;
   font: inherit;
   line-height: 1;
+}
+
+.composer button {
+  min-height: 34px;
+  min-width: 34px;
+  color: var(--bad);
+  background: #232a39;
+}
+
+.composer button[hidden] {
+  display: none;
 }
 
 .command-row {
@@ -787,7 +841,7 @@ textarea:disabled {
   }
 
   50% {
-    background: rgb(255 255 255 / 0.112);
+    background: rgb(255 255 255 / 0.093);
   }
 }
 
@@ -925,7 +979,21 @@ textarea:disabled {
 }
 
 #download-session {
-  font-size: 17px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.artifact-pane .pane-header {
+  flex: 0 0 41px;
+  min-height: 41px;
+  max-height: 41px;
+}
+
+.artifact-pane .actions button {
+  height: 24px;
+  min-height: 24px;
+  min-width: 24px;
+  padding: 0 6px;
   line-height: 1;
 }
 

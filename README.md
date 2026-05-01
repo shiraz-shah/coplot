@@ -6,17 +6,37 @@ The current MVP is intentionally dependency-light:
 
 - Python standard library HTTP server
 - Vanilla HTML, CSS, and JavaScript frontend
-- A project-local `.venv/` for analysis dependencies such as pandas and matplotlib
+- A workspace-local `venv/` for analysis dependencies such as pandas and matplotlib
+
+## Install
+
+During development:
+
+```bash
+python3 -m pip install -e .
+```
+
+From GitHub as an app:
+
+```bash
+pipx install git+https://github.com/yourname/coplot.git
+```
 
 ## Run
 
-From the project root:
+Point coplot at a workspace folder containing the data you want to analyze:
 
 ```bash
-python3 coplot_web/server.py
+coplot ~/projects/project_name
 ```
 
-Then open:
+You can also run the package module directly:
+
+```bash
+python3 -m coplot ~/projects/project_name
+```
+
+Then open the URL printed by the server, usually:
 
 ```text
 http://localhost:8765
@@ -26,9 +46,9 @@ On another machine on the same LAN, replace `localhost` with the machine's local
 
 ## Project Shape
 
-- `coplot_web/server.py` serves the app, persists local state, calls an OpenAI-compatible chat endpoint, and executes agent actions.
-- `coplot_web/session_worker.py` runs the persistent analysis Python session inside the project `.venv/`.
-- `coplot_web/static/` contains the browser UI.
+- `coplot/server.py` serves the app, persists local state, calls an OpenAI-compatible chat endpoint, and executes agent actions.
+- `coplot/session_worker.py` runs the persistent analysis Python session inside the workspace `venv/`.
+- `coplot/static/` contains the browser UI.
 - `web-interface-spec.md` captures the product direction.
 - `HANDOFF.md` captures the current implementation state and known rough edges.
 
@@ -40,12 +60,12 @@ The session download action exports a zip containing `chat.jsonl`, `analysis.py`
 
 The app creates local workspace files that are intentionally not committed:
 
-- `.venv/`
-- `.agent-data/`
+- `venv/`
+- `coplot_data/`
 - `plots/`
 - `analysis.py`
 - generated plot/image files
 
-This keeps GitHub focused on the coplot application source rather than one machine's current analysis session.
+This keeps GitHub focused on the coplot application source rather than one machine's current analysis session. Each workspace owns its own environment and coplot data.
 
-Model settings are application config, not session state. coplot reads and writes them at `coplot_web/config.json`. That file is intentionally ignored by Git because it contains local endpoint/model preferences.
+Workspace model settings live in `coplot_data/config.json`. The settings dialog can also save defaults for future workspaces at `~/.config/coplot/defaults.json`.

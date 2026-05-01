@@ -1,0 +1,2 @@
+"""coplot web app package."""
+

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=58"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coplot"
+version = "0.1.0"
+description = "Local web workspace for LLM-assisted data science."
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+coplot = "coplot.server:main"
+
+[tool.setuptools]
+packages = ["coplot"]
+
+[tool.setuptools.package-data]
+coplot = ["static/*.html", "static/*.css", "static/*.js"]

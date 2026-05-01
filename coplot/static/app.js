@@ -6,6 +6,11 @@ const state = {
   pendingChatMessage: "",
   terminalPending: null,
   fullscreenArtifactIndex: null,
+  settingsDialogShown: false,
+  settingsFirstRun: false,
+  editorDirty: false,
+  lastServerSource: "",
+  endpointModels: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -17,6 +22,7 @@ function setStatus(text) {
 function syncPendingControls() {
   $("#chat-input").disabled = state.chatPending;
   $("#command-input").disabled = Boolean(state.terminalPending);
+  $("#stop-agent").hidden = !(state.chatPending || state.terminalPending);
 }
 
 async function api(path, options = {}) {
@@ -40,8 +46,11 @@ function render(options = {}) {
   const data = state.data;
   $("#project-root").textContent = data.project.root;
   $("#source-name").textContent = data.project.source_file;
-  if (options.forceSource || document.activeElement !== $("#source-editor")) {
+  renderContextMeter(data.context_usage);
+  if (options.forceSource || (!state.editorDirty && document.activeElement !== $("#source-editor"))) {
     setEditorValue(data.source);
+    state.lastServerSource = data.source;
+    if (options.forceSource) state.editorDirty = false;
   }
   renderChat(data.chat);
   renderTranscript(data.transcript);
@@ -50,6 +59,26 @@ function render(options = {}) {
   syncPendingControls();
   setStatus("Ready");
   applyPendingEditorSelection();
+  maybeOpenFirstRunSettings();
+}
+
+function renderContextMeter(usage) {
+  const element = $("#context-meter");
+  if (!usage) {
+    element.textContent = "context --";
+    return;
+  }
+  const estimated = Math.round((usage.estimated_tokens || 0) / 100) / 10;
+  const limit = Math.round((usage.limit_tokens || 0) / 1000);
+  element.textContent = `context ~${estimated}k/${limit}k (${usage.percent || 0}%)`;
+  const breakdown = usage.breakdown || {};
+  element.title = [
+    "Approximate context size sent with the next model request.",
+    `code: ~${Math.round((breakdown.durable_code || 0) / 100) / 10}k`,
+    `chat: ~${Math.round((breakdown.recent_chat || 0) / 100) / 10}k`,
+    `transcript: ~${Math.round((breakdown.recent_transcript || 0) / 100) / 10}k`,
+    `artifacts: ~${Math.round((breakdown.artifacts || 0) / 100) / 10}k`,
+  ].join("\n");
 }
 
 function renderChat(entries) {
@@ -150,7 +179,7 @@ function renderArtifacts(artifacts) {
   }
   const artifact = plots[plots.length - 1];
   $("#artifact-view").innerHTML = `
-    <img alt="${escapeHtml(artifact.caption)}" src="/${encodeURI(artifact.path)}?v=${encodeURIComponent(artifact.created_at)}" />
+    <img alt="${escapeHtml(artifact.caption)}" title="Open plot" src="/${encodeURI(artifact.path)}?v=${encodeURIComponent(artifact.created_at)}" />
     <div class="artifact-meta-overlay">${formatArtifactMeta(artifact)}</div>
   `;
   $("#artifact-view img").addEventListener("click", () => openArtifactFullscreen(plots.length - 1));
@@ -170,12 +199,13 @@ function sortedPlotArtifacts(artifacts) {
 
 function renderModelSettings(settings) {
   $("#setting-endpoint-url").value = settings.endpoint_url || "http://localhost:11434";
-  $("#setting-model").value = settings.model || "qwen3:8b";
+  populateModelOptions(settings.model || "qwen3.5:2b");
   $("#setting-max-tokens").value = settings.max_tokens || 8192;
+  $("#setting-context-window").value = settings.context_window_tokens || 32768;
   $("#setting-temperature").value = settings.temperature ?? 0.2;
-  $("#setting-timeout").value = settings.timeout_seconds || 1800;
+  $("#setting-timeout").value = settings.timeout_seconds || 600;
   $("#setting-reasoning-enabled").checked = Boolean(settings.reasoning_enabled);
-  $("#setting-reasoning-effort").value = settings.reasoning_effort || "medium";
+  $("#setting-reasoning-control").value = settings.reasoning_control || "auto";
 }
 
 function readModelSettingsForm() {
@@ -183,11 +213,59 @@ function readModelSettingsForm() {
     endpoint_url: $("#setting-endpoint-url").value.trim(),
     model: $("#setting-model").value.trim(),
     max_tokens: Number($("#setting-max-tokens").value),
+    context_window_tokens: Number($("#setting-context-window").value),
     temperature: Number($("#setting-temperature").value),
     timeout_seconds: Number($("#setting-timeout").value),
     reasoning_enabled: $("#setting-reasoning-enabled").checked,
-    reasoning_effort: $("#setting-reasoning-effort").value,
+    reasoning_control: $("#setting-reasoning-control").value || "auto",
   };
+}
+
+function populateModelOptions(selectedModel, models = null) {
+  const select = $("#setting-model");
+  if (models) state.endpointModels = models;
+  const selected = selectedModel || select.value || "qwen3.5:2b";
+  const ids = models && models.length ? models.map((model) => model.id).filter(Boolean) : [selected];
+  if (!ids.includes(selected)) ids.unshift(selected);
+  select.innerHTML = "";
+  for (const id of ids) {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = id;
+    select.appendChild(option);
+  }
+  select.value = ids.includes(selected) ? selected : ids[0] || "";
+}
+
+function selectedModelContextWindow(models, selectedModel) {
+  const match = (models || []).find((model) => model.id === selectedModel);
+  const value = Number(match?.context_window_tokens || 0);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function setSettingsMessage(message, isError = false) {
+  const element = $("#settings-message");
+  element.textContent = message;
+  element.classList.toggle("error", isError);
+}
+
+function openSettingsDialog({ firstRun = false } = {}) {
+  state.settingsFirstRun = firstRun;
+  state.settingsDialogShown = true;
+  renderModelSettings(state.data.model_settings);
+  $("#settings-title").textContent = firstRun ? "Set Up Workspace" : "Chat Settings";
+  $("#proceed-model-settings").textContent = firstRun ? "Proceed" : "Apply";
+  $("#proceed-model-settings").title = firstRun
+    ? "Save these settings for this workspace and enter coplot"
+    : "Save these settings for this workspace";
+  $("#close-model-settings").hidden = firstRun;
+  setSettingsMessage(firstRun ? "Connect to your local model server, choose a model, then proceed." : "");
+  $("#model-settings-dialog").showModal();
+}
+
+function maybeOpenFirstRunSettings() {
+  if (state.settingsDialogShown || !state.data?.project?.first_run) return;
+  openSettingsDialog({ firstRun: true });
 }
 
 function escapeHtml(value) {
@@ -233,6 +311,7 @@ function formatMarkdownLite(value) {
 function setEditorValue(value) {
   $("#source-editor").value = value;
   updateSourceHighlight();
+  updateCurrentLineHighlight();
 }
 
 function applyPendingEditorSelection() {
@@ -271,6 +350,10 @@ async function postAndRefresh(path, body, options = {}) {
     state.data = payload.state || state.data;
     const actions = payload.result?.actions || [];
     state.pendingEditorSelection = findEditorSelection(actions);
+    if (options.savedSource !== undefined) {
+      state.editorDirty = false;
+      state.lastServerSource = options.savedSource;
+    }
     state.chatPending = false;
     state.pendingChatMessage = "";
     state.terminalPending = null;
@@ -294,18 +377,65 @@ function selectedEditorCode() {
   return editor.value.slice(editor.selectionStart, editor.selectionEnd);
 }
 
+function currentEditorLine() {
+  const editor = $("#source-editor");
+  const source = editor.value;
+  const start = source.lastIndexOf("\n", Math.max(0, editor.selectionStart - 1)) + 1;
+  const next = source.indexOf("\n", editor.selectionStart);
+  const end = next === -1 ? source.length : next;
+  return source.slice(start, end);
+}
+
+function nextLineStartAfterEditorExecution() {
+  const editor = $("#source-editor");
+  const source = editor.value;
+  const anchor = editor.selectionStart === editor.selectionEnd ? editor.selectionStart : editor.selectionEnd;
+  const nextBreak = source.indexOf("\n", anchor);
+  if (nextBreak === -1) return source.length;
+  return nextBreak + 1;
+}
+
+function moveEditorCursor(position) {
+  const editor = $("#source-editor");
+  const next = Math.max(0, Math.min(position, editor.value.length));
+  editor.focus();
+  editor.setSelectionRange(next, next);
+  updateSourceHighlight();
+}
+
 async function runSelectedEditorCode() {
-  const code = selectedEditorCode();
+  const code = selectedEditorCode() || currentEditorLine();
   if (!code.trim()) return;
+  const nextPosition = nextLineStartAfterEditorExecution();
   await postAndRefresh(
     "/api/run-session",
     { code, source: "user_executed" },
     { terminalPending: { kind: "session", source: "user_executed", input: code } },
   );
+  moveEditorCursor(nextPosition);
 }
 
 function updateSourceHighlight() {
-  $("#source-highlight").innerHTML = highlightPython($("#source-editor").value);
+  const editor = $("#source-editor");
+  $("#source-highlight").innerHTML = highlightPython(editor.value);
+  updateCurrentLineHighlight();
+}
+
+function currentEditorLineIndex() {
+  const editor = $("#source-editor");
+  return editor.value.slice(0, editor.selectionStart).split("\n").length - 1;
+}
+
+function updateCurrentLineHighlight() {
+  const editor = $("#source-editor");
+  const highlight = $("#current-line-highlight");
+  if (!highlight) return;
+  const style = getComputedStyle(editor);
+  const lineHeight = parseFloat(style.lineHeight) || 20;
+  const paddingTop = parseFloat(style.paddingTop) || 0;
+  const lineIndex = currentEditorLineIndex();
+  highlight.style.top = `${paddingTop + lineIndex * lineHeight - editor.scrollTop}px`;
+  highlight.style.height = `${lineHeight}px`;
 }
 
 function highlightPython(source) {
@@ -370,7 +500,12 @@ function openArtifactFullscreen(index) {
 }
 
 $("#save-source").addEventListener("click", async () => {
-  await postAndRefresh("/api/save", { source: $("#source-editor").value });
+  const source = $("#source-editor").value;
+  await postAndRefresh("/api/save", { source }, { savedSource: source });
+});
+
+$("#run-selected").addEventListener("click", async () => {
+  await runSelectedEditorCode();
 });
 
 $("#run-file").addEventListener("click", async () => {
@@ -378,7 +513,7 @@ $("#run-file").addEventListener("click", async () => {
   await postAndRefresh(
     "/api/run-file",
     { source },
-    { terminalPending: { kind: "session", source: "durable_script", input: source } },
+    { terminalPending: { kind: "session", source: "durable_script", input: source }, savedSource: source },
   );
 });
 
@@ -445,12 +580,18 @@ $("#chat-form").addEventListener("submit", async (event) => {
 });
 
 $("#source-editor").addEventListener("input", updateSourceHighlight);
+$("#source-editor").addEventListener("input", () => {
+  state.editorDirty = $("#source-editor").value !== state.lastServerSource;
+});
 $("#source-editor").addEventListener("scroll", () => {
   const editor = $("#source-editor");
   const highlight = $("#source-highlight");
   highlight.scrollTop = editor.scrollTop;
   highlight.scrollLeft = editor.scrollLeft;
+  updateCurrentLineHighlight();
 });
+$("#source-editor").addEventListener("click", updateCurrentLineHighlight);
+$("#source-editor").addEventListener("keyup", updateCurrentLineHighlight);
 
 $("#chat-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
@@ -488,24 +629,69 @@ document.addEventListener("keydown", async (event) => {
 });
 
 $("#open-model-settings").addEventListener("click", () => {
-  renderModelSettings(state.data.model_settings);
-  $("#model-settings-dialog").showModal();
+  openSettingsDialog({ firstRun: false });
 });
 
 $("#close-model-settings").addEventListener("click", () => {
   $("#model-settings-dialog").close();
 });
 
-$("#model-settings-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await postAndRefresh("/api/model-settings", readModelSettingsForm());
-  $("#model-settings-dialog").close();
+$("#connect-model-endpoint").addEventListener("click", async () => {
+  const endpointUrl = $("#setting-endpoint-url").value.trim();
+  setSettingsMessage("Connecting...");
+  try {
+    const result = await api("/api/model-endpoint", {
+      method: "POST",
+      body: JSON.stringify({ endpoint_url: endpointUrl }),
+    });
+    const current = $("#setting-model").value || state.data.model_settings.model;
+    const models = result.models || [];
+    const selected = models.some((model) => model.id === current) ? current : models[0]?.id || current;
+    populateModelOptions(selected, models);
+    const contextWindow = selectedModelContextWindow(models, selected);
+    if (contextWindow) $("#setting-context-window").value = contextWindow;
+    $("#setting-reasoning-control").value = result.reasoning_control || "auto";
+    setSettingsMessage(`Connected. Reasoning control: ${result.reasoning_control || "auto"}.`);
+  } catch (error) {
+    setSettingsMessage(error.message, true);
+  }
 });
 
-$("#refresh-context").addEventListener("click", async () => {
-  const payload = await api("/api/context");
-  $("#context-payload").textContent = JSON.stringify(payload, null, 2);
-  $("#context-dialog").showModal();
+$("#setting-model").addEventListener("change", () => {
+  const contextWindow = selectedModelContextWindow(state.endpointModels, $("#setting-model").value);
+  if (contextWindow) $("#setting-context-window").value = contextWindow;
+});
+
+$("#save-model-defaults").addEventListener("click", async () => {
+  setSettingsMessage("Saving defaults...");
+  try {
+    await api("/api/model-settings-defaults", {
+      method: "POST",
+      body: JSON.stringify(readModelSettingsForm()),
+    });
+    setSettingsMessage("Saved as defaults for future workspaces.");
+  } catch (error) {
+    setSettingsMessage(error.message, true);
+  }
+});
+
+$("#model-settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const path = state.settingsFirstRun ? "/api/model-settings-proceed" : "/api/model-settings";
+  await postAndRefresh(path, readModelSettingsForm());
+  $("#model-settings-dialog").close();
+  state.settingsFirstRun = false;
+});
+
+$("#clear-context").addEventListener("click", async () => {
+  await postAndRefresh("/api/clear-context", {});
+});
+
+$("#stop-agent").addEventListener("click", async () => {
+  await api("/api/stop", { method: "POST", body: JSON.stringify({}) });
+  state.chatPending = false;
+  state.terminalPending = null;
+  await refresh();
 });
 
 $("#close-context").addEventListener("click", () => {
