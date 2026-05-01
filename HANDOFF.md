@@ -445,3 +445,72 @@ Adding cache busting or disabling static caching during development is still a g
 - Continue flattening and auditing old CSS rules; the stylesheet now contains old base rules plus later overrides.
 - Consider separating CSS into reset/base/layout/components/theme sections to avoid override drift.
 - Add visual tests or Playwright screenshots once the UI direction stabilizes.
+
+## App Packaging And Workspace Handoff
+
+coplot is now shaped as a packageable app rather than a single-folder prototype.
+
+Current launch paths:
+
+```bash
+python3 -m coplot ~/projects/project_name
+coplot ~/projects/project_name
+```
+
+Package metadata lives in `pyproject.toml`, with a compatibility `setup.py` for older local setuptools. The installed console command points at `coplot.server:main`.
+
+The application package is now `coplot/`:
+
+- `coplot/server.py`
+- `coplot/session_worker.py`
+- `coplot/static/index.html`
+- `coplot/static/app.js`
+- `coplot/static/styles.css`
+
+The workspace folder is separate from the app source. For a Python workspace, coplot creates and uses:
+
+```text
+analysis.py
+venv/
+plots/
+coplot_data/
+  config.json
+  chat.jsonl
+  transcript.jsonl
+  artifacts.jsonl
+  summary.md
+```
+
+Workspace model settings live in `coplot_data/config.json`. The settings UI can save defaults for future workspaces at:
+
+```text
+~/.config/coplot/defaults.json
+```
+
+Reasoning control is endpoint-aware:
+
+- Ollama disables thinking with `reasoning_effort: "none"`.
+- vLLM/SGLang-style endpoints disable thinking with `chat_template_kwargs.enable_thinking = false`.
+
+Model endpoint detection:
+
+- vLLM context length is read from `/v1/models` via `max_model_len`.
+- Ollama loaded-model context length is read from `/api/ps` via `context_length` when the selected model is currently loaded.
+- Otherwise the context window remains editable in settings.
+
+Recent core UX fixes:
+
+- The context meter shows approximate context usage and a hover breakdown by code, chat, transcript, and artifacts.
+- Clear context clears chat, transcript, and summary without clearing durable code or artifacts.
+- `Cmd/Ctrl+Enter` runs the selected code, or the current line when nothing is selected, then moves the cursor to the next line.
+- Editor dirty state prevents ad hoc session/shell actions from reverting unsaved manual edits.
+- Stop means no further automatic agent follow-up turns; it does not interrupt the current model request or reset the Python session.
+- Agent ad hoc code/shell outputs are returned to the model for up to three follow-up turns unless stopped.
+
+Remaining product steps:
+
+- R support with project-local `renv` handling.
+- Replace the textarea/highlight mirror with CodeMirror or Monaco for robust editing, selection, syntax, and keybinding behavior.
+- Real streaming for chat and terminal output.
+- Better tests around workspace state, config layering, context counting, agent follow-up loops, and plot registration.
+- Revisit artifact pinning or remove unused backend paths if the latest-plot model remains the primary UX.
