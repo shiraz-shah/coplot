@@ -11,6 +11,8 @@ const state = {
   editorDirty: false,
   lastServerSource: "",
   endpointModels: [],
+  pendingPollTimer: null,
+  pendingChatBaselineLength: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -53,11 +55,11 @@ function render(options = {}) {
     if (options.forceSource) state.editorDirty = false;
   }
   renderChat(data.chat);
-  renderTranscript(data.transcript);
+  renderTranscript(data.transcript, data.active_jobs || []);
   renderArtifacts(data.artifacts);
   renderModelSettings(data.model_settings);
   syncPendingControls();
-  setStatus("Ready");
+  setStatus(isWorkPending() ? "Working" : "Ready");
   applyPendingEditorSelection();
   maybeOpenFirstRunSettings();
 }
@@ -98,13 +100,22 @@ function renderChat(entries) {
     `;
     log.appendChild(item);
   }
-  if (state.pendingChatMessage) {
+  if (shouldRenderPendingUserMessage(entries)) {
     log.appendChild(renderPendingUserMessage(state.pendingChatMessage));
   }
   if (state.chatPending) {
     log.appendChild(renderTypingMessage());
   }
   log.scrollTop = log.scrollHeight;
+}
+
+function shouldRenderPendingUserMessage(entries) {
+  if (!state.pendingChatMessage) return false;
+  const newEntries = entries.slice(state.pendingChatBaselineLength);
+  const serverHasPendingMessage = newEntries.some(
+    (entry) => entry.role === "user" && entry.content === state.pendingChatMessage
+  );
+  return !serverHasPendingMessage;
 }
 
 function renderPendingUserMessage(content) {
@@ -129,10 +140,11 @@ function renderTypingMessage() {
   return item;
 }
 
-function renderTranscript(entries) {
+function renderTranscript(entries, activeJobs = []) {
   const transcript = $("#transcript");
   transcript.innerHTML = "";
-  if (!entries.length && !state.terminalPending) {
+  const localPending = pendingTranscriptEntries(activeJobs);
+  if (!entries.length && !activeJobs.length && !localPending.length) {
     transcript.innerHTML = '<div class="empty">Run durable code, session snippets, or shell commands to create transcript entries.</div>';
     return;
   }
@@ -152,18 +164,43 @@ function renderTranscript(entries) {
     `;
     transcript.appendChild(item);
   }
-  if (state.terminalPending) {
-    transcript.appendChild(renderPendingTranscriptEntry(state.terminalPending));
+  for (const job of activeJobs) {
+    transcript.appendChild(renderPendingTranscriptEntry(activeJobToPending(job)));
+  }
+  for (const pending of localPending) {
+    transcript.appendChild(renderPendingTranscriptEntry(pending));
   }
   transcript.scrollTop = transcript.scrollHeight;
+}
+
+function pendingTranscriptEntries(activeJobs = []) {
+  if (!state.terminalPending) return [];
+  const alreadyVisible = activeJobs.some((job) => {
+    return (
+      String(job.kind || "") === String(state.terminalPending.kind || "") &&
+      String(job.source || "") === String(state.terminalPending.source || "") &&
+      String(job.input || "") === String(state.terminalPending.input || "")
+    );
+  });
+  return alreadyVisible ? [] : [state.terminalPending];
+}
+
+function activeJobToPending(job) {
+  return {
+    kind: job.kind || "session",
+    source: job.source || "unknown",
+    input: job.input || "",
+    started_at: job.started_at || "",
+  };
 }
 
 function renderPendingTranscriptEntry(pending) {
   const item = document.createElement("div");
   item.className = "entry pending-entry";
   const languageClass = pending.kind === "shell" ? "shell-entry" : "session-entry";
+  const started = pending.started_at ? ` · started ${formatTime(pending.started_at)}` : "";
   item.innerHTML = `
-    <div class="label">${escapeHtml(pending.kind)} · ${escapeHtml(pending.source)} · <span class="running">running</span></div>
+    <div class="label">${escapeHtml(pending.kind)} · ${escapeHtml(pending.source)} · <span class="running">running</span>${started}</div>
     <pre class="transcript-input ${languageClass}">${escapeHtml(pending.input)}</pre>
     <div class="running-dots" aria-label="Command is running"><span></span><span></span><span></span></div>
   `;
@@ -336,15 +373,43 @@ function renderPendingState() {
   if (!state.data) return;
   syncPendingControls();
   renderChat(state.data.chat);
-  renderTranscript(state.data.transcript);
+  renderTranscript(state.data.transcript, state.data.active_jobs || []);
+}
+
+function isWorkPending() {
+  return state.chatPending || Boolean(state.terminalPending) || Boolean(state.data?.active_jobs?.length);
+}
+
+function startPendingPoll() {
+  if (state.pendingPollTimer) return;
+  state.pendingPollTimer = window.setInterval(async () => {
+    if (!isWorkPending()) {
+      stopPendingPoll();
+      return;
+    }
+    try {
+      state.data = await api("/api/state");
+      render();
+    } catch (error) {
+      setStatus(error.message);
+    }
+  }, 1200);
+}
+
+function stopPendingPoll() {
+  if (!state.pendingPollTimer) return;
+  window.clearInterval(state.pendingPollTimer);
+  state.pendingPollTimer = null;
 }
 
 async function postAndRefresh(path, body, options = {}) {
   setStatus("Working");
+  state.pendingChatBaselineLength = state.data?.chat?.length || 0;
   state.chatPending = Boolean(options.chatPending);
   state.pendingChatMessage = options.pendingChatMessage || "";
   state.terminalPending = options.terminalPending || null;
   renderPendingState();
+  startPendingPoll();
   try {
     const payload = await api(path, { method: "POST", body: JSON.stringify(body) });
     state.data = payload.state || state.data;
@@ -356,14 +421,18 @@ async function postAndRefresh(path, body, options = {}) {
     }
     state.chatPending = false;
     state.pendingChatMessage = "";
+    state.pendingChatBaselineLength = 0;
     state.terminalPending = null;
+    stopPendingPoll();
     syncPendingControls();
     render({ forceSource: Boolean(state.pendingEditorSelection) });
     return payload;
   } catch (error) {
     state.chatPending = false;
     state.pendingChatMessage = "";
+    state.pendingChatBaselineLength = 0;
     state.terminalPending = null;
+    stopPendingPoll();
     syncPendingControls();
     renderPendingState();
     setStatus(error.message);
@@ -418,7 +487,17 @@ async function runSelectedEditorCode() {
 function updateSourceHighlight() {
   const editor = $("#source-editor");
   $("#source-highlight").innerHTML = highlightPython(editor.value);
+  updateLineNumbers();
   updateCurrentLineHighlight();
+}
+
+function updateLineNumbers() {
+  const editor = $("#source-editor");
+  const gutter = $("#source-line-numbers");
+  if (!gutter) return;
+  const lineCount = Math.max(1, editor.value.split("\n").length);
+  gutter.textContent = Array.from({ length: lineCount }, (_, index) => String(index + 1)).join("\n");
+  gutter.scrollTop = editor.scrollTop;
 }
 
 function currentEditorLineIndex() {
@@ -586,8 +665,10 @@ $("#source-editor").addEventListener("input", () => {
 $("#source-editor").addEventListener("scroll", () => {
   const editor = $("#source-editor");
   const highlight = $("#source-highlight");
+  const gutter = $("#source-line-numbers");
   highlight.scrollTop = editor.scrollTop;
   highlight.scrollLeft = editor.scrollLeft;
+  if (gutter) gutter.scrollTop = editor.scrollTop;
   updateCurrentLineHighlight();
 });
 $("#source-editor").addEventListener("click", updateCurrentLineHighlight);

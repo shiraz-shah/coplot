@@ -3,7 +3,12 @@
 coplot_data/
 plots/
 analysis.py
+coplot/venv/
+coplot/plots/
+coplot/*.jsonl
+coplot/summary.md
 coplot/config.json
+coplot.py
 
 # Local analysis environments and Python caches
 .venv/

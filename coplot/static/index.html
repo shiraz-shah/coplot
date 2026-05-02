@@ -19,16 +19,17 @@
       <section class="pane editor-pane">
         <div class="pane-header">
           <div>
-            <strong id="source-name">analysis.py</strong>
+            <strong id="source-name">coplot.py</strong>
             <span>durable code</span>
           </div>
           <div class="actions">
-            <button id="save-source" type="button" title="Save analysis.py" aria-label="Save analysis.py">⇣</button>
+            <button id="save-source" type="button" title="Save coplot.py" aria-label="Save coplot.py">⇣</button>
             <button id="run-selected" type="button" title="Run selected (Cmd/Ctrl+Enter)" aria-label="Run selected">▸</button>
             <button id="run-file" type="button" title="Run file" aria-label="Run file">▶</button>
           </div>
         </div>
         <div class="editor-shell">
+          <pre id="source-line-numbers" aria-hidden="true">1</pre>
           <pre id="source-highlight" aria-hidden="true"></pre>
           <div id="current-line-highlight" aria-hidden="true"></div>
           <textarea id="source-editor" spellcheck="false" wrap="off" aria-label="Durable code editor"></textarea>

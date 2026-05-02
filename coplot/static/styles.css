@@ -515,6 +515,7 @@ textarea:disabled {
 }
 
 #source-editor,
+#source-line-numbers,
 #source-highlight {
   position: absolute;
   inset: 0;
@@ -528,17 +529,37 @@ textarea:disabled {
   line-height: 20px;
 }
 
+#source-line-numbers {
+  z-index: 2;
+  right: auto;
+  width: 46px;
+  padding: 14px 8px 14px 0;
+  overflow: hidden;
+  color: rgb(107 191 141 / 0.46);
+  font-weight: 500;
+  text-align: right;
+  user-select: none;
+  background: rgb(0 0 0 / 0.18);
+  border-right: 1px solid rgb(255 255 255 / 0.08);
+}
+
 #current-line-highlight {
   position: absolute;
-  left: 0;
+  left: 46px;
   right: 0;
   z-index: 1;
   pointer-events: none;
   background: rgb(54 241 209 / 0.14);
 }
 
+#source-editor,
+#source-highlight {
+  left: 46px;
+  padding-left: 12px;
+}
+
 #source-editor {
-  z-index: 2;
+  z-index: 3;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -910,12 +931,23 @@ textarea:disabled {
 
 .artifact-view {
   position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 8px;
   background: #000;
 }
 
 .artifact-view img {
-  max-width: calc(100% - 8px);
-  max-height: calc(100% - 8px);
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
   object-fit: contain;
   background: white;
   border-radius: 0;

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -42,6 +43,7 @@ python_session: "PythonSession"
 shell_session: "ShellSession"
 context_builder: "ContextBuilder"
 agent_service: "AgentService"
+active_job_store: "ActiveJobStore"
 workspace_first_run = False
 stop_requested = False
 
@@ -152,19 +154,19 @@ class ProjectState:
     @classmethod
     def discover(cls, root: Path) -> "ProjectState":
         root = root.expanduser().resolve()
-        agent_data_dir = root / "coplot_data"
+        agent_data_dir = root / "coplot"
         return cls(
             root=root,
-            source_file=root / "analysis.py",
+            source_file=root / "coplot.py",
             agent_data_dir=agent_data_dir,
             summary_file=agent_data_dir / "summary.md",
             chat_file=agent_data_dir / "chat.jsonl",
             transcript_file=agent_data_dir / "transcript.jsonl",
             artifacts_file=agent_data_dir / "artifacts.jsonl",
             model_settings_file=agent_data_dir / "config.json",
-            venv_dir=root / "venv",
-            venv_python=root / "venv" / "bin" / "python",
-            plots_dir=root / "plots",
+            venv_dir=agent_data_dir / "venv",
+            venv_python=agent_data_dir / "venv" / "bin" / "python",
+            plots_dir=agent_data_dir / "plots",
         )
 
     def ensure(self) -> None:
@@ -555,11 +557,55 @@ class ArtifactStore:
         self.path.write_text("", encoding="utf-8")
 
 
+class ActiveJobStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, dict[str, Any]] = {}
+
+    def begin(self, *, kind: str, language: str | None = None, source: str, input_text: str) -> str:
+        job_id = str(uuid4())
+        payload = {
+            "id": job_id,
+            "kind": kind,
+            "language": language,
+            "source": source,
+            "input": input_text,
+            "started_at": utc_now_iso(),
+            "status": "running",
+        }
+        with self._lock:
+            self._jobs[job_id] = payload
+        return job_id
+
+    def finish(self, job_id: str) -> None:
+        with self._lock:
+            self._jobs.pop(job_id, None)
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return sorted(
+                [dict(job) for job in self._jobs.values()],
+                key=lambda job: str(job.get("started_at", "")),
+            )
+
+    def clear(self) -> None:
+        with self._lock:
+            self._jobs.clear()
+
+
 class PythonSession:
-    def __init__(self, project: ProjectState, transcript: TranscriptStore, artifacts: ArtifactStore, plots_dir: Path) -> None:
+    def __init__(
+        self,
+        project: ProjectState,
+        transcript: TranscriptStore,
+        artifacts: ArtifactStore,
+        active_jobs: ActiveJobStore,
+        plots_dir: Path,
+    ) -> None:
         self.project = project
         self.transcript = transcript
         self.artifacts = artifacts
+        self.active_jobs = active_jobs
         self.plots_dir = plots_dir
         self.process: subprocess.Popen[str] | None = None
 
@@ -608,27 +654,31 @@ class PythonSession:
         return env
 
     def execute(self, code: str, *, source: str, interactive: bool = False) -> dict[str, Any]:
+        job_id = self.active_jobs.begin(kind="session", language="python", source=source, input_text=code)
         start = time.perf_counter()
-        before_pngs = self._png_snapshot()
-        response = self._send_worker_request(
-            {
-                "code": code,
-                "interactive": interactive,
-            }
-        )
-        generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
-        duration_ms = int((time.perf_counter() - start) * 1000)
-        entry = self.transcript.append_session(
-            language="python",
-            source=source,
-            code=code,
-            stdout=str(response.get("stdout", "")),
-            stderr=str(response.get("stderr", "")),
-            ok=bool(response.get("ok")),
-            duration_ms=duration_ms,
-            artifacts=generated_artifacts,
-        )
-        return {"entry": entry, "artifacts": generated_artifacts}
+        try:
+            before_pngs = self._png_snapshot()
+            response = self._send_worker_request(
+                {
+                    "code": code,
+                    "interactive": interactive,
+                }
+            )
+            generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            entry = self.transcript.append_session(
+                language="python",
+                source=source,
+                code=code,
+                stdout=str(response.get("stdout", "")),
+                stderr=str(response.get("stderr", "")),
+                ok=bool(response.get("ok")),
+                duration_ms=duration_ms,
+                artifacts=generated_artifacts,
+            )
+            return {"entry": entry, "artifacts": generated_artifacts}
+        finally:
+            self.active_jobs.finish(job_id)
 
     def _png_snapshot(self) -> dict[Path, tuple[int, int]]:
         snapshot: dict[Path, tuple[int, int]] = {}
@@ -677,12 +727,14 @@ class PythonSession:
         return json.loads(line)
 
 class ShellSession:
-    def __init__(self, project: ProjectState, transcript: TranscriptStore, cwd: Path) -> None:
+    def __init__(self, project: ProjectState, transcript: TranscriptStore, active_jobs: ActiveJobStore, cwd: Path) -> None:
         self.project = project
         self.transcript = transcript
+        self.active_jobs = active_jobs
         self.cwd = cwd
 
     def execute(self, command: str, *, source: str = "user_shell") -> dict[str, Any]:
+        job_id = self.active_jobs.begin(kind="shell", source=source, input_text=command)
         self.project.ensure_venv()
         env = os.environ.copy()
         bin_dir = str(self.project.venv_dir / "bin")
@@ -690,27 +742,30 @@ class ShellSession:
         env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         env.pop("PYTHONHOME", None)
         start = time.perf_counter()
-        completed = subprocess.run(
-            command,
-            shell=True,
-            cwd=self.cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=120,
-            executable="/bin/bash",
-        )
-        duration_ms = int((time.perf_counter() - start) * 1000)
-        return self.transcript.append_shell(
-            source=source,
-            command=command,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            ok=completed.returncode == 0,
-            exit_code=completed.returncode,
-            duration_ms=duration_ms,
-            cwd=self.cwd,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.cwd,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=120,
+                executable="/bin/bash",
+            )
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            return self.transcript.append_shell(
+                source=source,
+                command=command,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                ok=completed.returncode == 0,
+                exit_code=completed.returncode,
+                duration_ms=duration_ms,
+                cwd=self.cwd,
+            )
+        finally:
+            self.active_jobs.finish(job_id)
 
 
 class ContextBuilder:
@@ -801,12 +856,14 @@ class AgentService:
         prompt = (
             "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
             "session scratch work, shell commands, and artifacts clearly separated.\n\n"
-            "When durable code should change, emit a fenced coplot-edit JSON block with "
-            "1-based inclusive line edits for analysis.py:\n"
+            "When durable code should change, emit a fenced coplot-edit JSON block for "
+            "coplot.py. The block must be a JSON list of edits using 1-based line "
+            "numbers against the current editor contents. end_line is inclusive:\n"
             "```coplot-edit\n"
             "[{\"start_line\": 1, \"end_line\": 1, \"replacement\": \"print('new code')\\n\"}]\n"
             "```\n"
-            "Use start_line 0 and end_line 0 to insert at the beginning of an empty file. "
+            "Use start_line N and end_line 0 to insert before line N. Use start_line 0 "
+            "and end_line 0 to insert at the beginning of an empty file. "
             "When you need ad hoc Python inspection in the shared live session, emit:\n"
             "```coplot-run\n"
             "print(df.shape)\n"
@@ -820,7 +877,7 @@ class AgentService:
             "project venv; install Python packages with python -m pip install ... so they land "
             "in that environment. The user will often ask you to visually inspect plots for "
             "feedback. You can only see plots if they have been saved as PNG files in the "
-            "./plots/ folder. Therefore, always save plots as PNG files in ./plots/. Calling "
+            "./coplot/plots/ folder. Therefore, always save plots as PNG files in ./coplot/plots/. Calling "
             "plt.show() may show a plot to the user in their local environment, but it does "
             "not make the plot visible to you. If plot images are attached to the user message, inspect the "
             "image directly instead of saying you cannot see it.\n\n"
@@ -996,6 +1053,7 @@ def configure_app(workspace_root: Path) -> None:
     global shell_session
     global context_builder
     global agent_service
+    global active_job_store
     global workspace_first_run
 
     project = ProjectState.discover(workspace_root)
@@ -1004,10 +1062,11 @@ def configure_app(workspace_root: Path) -> None:
     chat_store = ChatStore(project.chat_file)
     transcript_store = TranscriptStore(project.transcript_file)
     artifact_store = ArtifactStore(project.artifacts_file, project.root)
+    active_job_store = ActiveJobStore()
     model_settings_store = ModelSettingsStore(project.model_settings_file, DEFAULTS_FILE)
     model_settings_store.ensure_workspace_config()
-    python_session = PythonSession(project, transcript_store, artifact_store, project.plots_dir)
-    shell_session = ShellSession(project, transcript_store, project.root)
+    python_session = PythonSession(project, transcript_store, artifact_store, active_job_store, project.plots_dir)
+    shell_session = ShellSession(project, transcript_store, active_job_store, project.root)
     context_builder = ContextBuilder(project, chat_store, transcript_store, artifact_store)
     agent_service = AgentService(
         project,
@@ -1026,6 +1085,10 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), format % args))
 
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         request_path = parsed.path
@@ -1035,8 +1098,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(context_builder.payload())
         if request_path == "/api/download-session":
             return self.download_session()
-        if request_path.startswith("/plots/"):
+        if request_path.startswith("/plots/") or request_path.startswith("/coplot/plots/"):
             artifact_path = (project.root / request_path.lstrip("/")).resolve()
+            if request_path.startswith("/plots/"):
+                artifact_path = (project.plots_dir / request_path.removeprefix("/plots/")).resolve()
             if not artifact_path.is_relative_to(project.plots_dir.resolve()):
                 return self.send_error(HTTPStatus.FORBIDDEN)
             return self.serve_file(artifact_path)
@@ -1102,7 +1167,7 @@ class Handler(SimpleHTTPRequestHandler):
             if project.source_file.exists():
                 archive.write(project.source_file, project.source_file.name)
             if project.plots_dir.exists():
-                archive.writestr("plots/", "")
+                archive.writestr("coplot/plots/", "")
                 for path in sorted(project.plots_dir.rglob("*")):
                     if path.is_file():
                         archive.write(path, path.resolve().relative_to(project.root.resolve()))
@@ -1135,6 +1200,7 @@ class Handler(SimpleHTTPRequestHandler):
             "source": project.source_file.read_text(encoding="utf-8"),
             "chat": chat_store.recent(100),
             "transcript": transcript_store.recent(100),
+            "active_jobs": active_job_store.list(),
             "artifacts": artifact_store.list(),
             "model_settings": model_settings_store.read(),
             "context_usage": {
@@ -1162,6 +1228,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def clear_session(self, body: dict[str, Any]) -> None:
         python_session.clear()
+        active_job_store.clear()
         project.source_file.write_text("", encoding="utf-8")
         project.chat_file.write_text("", encoding="utf-8")
         project.transcript_file.write_text("", encoding="utf-8")

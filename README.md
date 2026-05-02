@@ -6,7 +6,7 @@ The current MVP is intentionally dependency-light:
 
 - Python standard library HTTP server
 - Vanilla HTML, CSS, and JavaScript frontend
-- A workspace-local `venv/` for analysis dependencies such as pandas and matplotlib
+- A workspace-local `coplot/venv/` for analysis dependencies such as pandas and matplotlib
 
 ## Install
 
@@ -47,25 +47,23 @@ On another machine on the same LAN, replace `localhost` with the machine's local
 ## Project Shape
 
 - `coplot/server.py` serves the app, persists local state, calls an OpenAI-compatible chat endpoint, and executes agent actions.
-- `coplot/session_worker.py` runs the persistent analysis Python session inside the workspace `venv/`.
+- `coplot/session_worker.py` runs the persistent analysis Python session inside the workspace `coplot/venv/`.
 - `coplot/static/` contains the browser UI.
 - `web-interface-spec.md` captures the product direction.
 - `HANDOFF.md` captures the current implementation state and known rough edges.
 
-PNG files created or modified in `plots/` by executed Python code are registered or updated as plot artifacts and shown in the artifact pane.
+PNG files created or modified in `coplot/plots/` by executed Python code are registered or updated as plot artifacts and shown in the artifact pane.
 
-The session download action exports a zip containing `chat.jsonl`, `analysis.py`, and `plots/`.
+The session download action exports a zip containing `chat.jsonl`, `coplot.py`, and `coplot/plots/`.
 
 ## Local State
 
 The app creates local workspace files that are intentionally not committed:
 
-- `venv/`
-- `coplot_data/`
-- `plots/`
-- `analysis.py`
+- `coplot.py`
+- `coplot/`
 - generated plot/image files
 
 This keeps GitHub focused on the coplot application source rather than one machine's current analysis session. Each workspace owns its own environment and coplot data.
 
-Workspace model settings live in `coplot_data/config.json`. The settings dialog can also save defaults for future workspaces at `~/.config/coplot/defaults.json`.
+Workspace model settings live in `coplot/config.json`. The settings dialog can also save defaults for future workspaces at `~/.config/coplot/defaults.json`.
