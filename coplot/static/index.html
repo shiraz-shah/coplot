@@ -44,7 +44,7 @@
           </div>
           <div class="actions">
             <button id="open-model-settings" type="button" title="Settings" aria-label="Settings">⚙</button>
-            <button id="clear-context" type="button" title="Clear chat and execution context" aria-label="Clear context">◧</button>
+            <button id="clear-context" type="button" title="Clear transcript context" aria-label="Clear transcript context">◧</button>
           </div>
         </div>
         <div id="chat-log" class="scroll"></div>
@@ -99,6 +99,23 @@
           <strong id="settings-title">Chat Settings</strong>
           <button id="close-model-settings" type="button" title="Close" aria-label="Close">×</button>
         </div>
+        <section id="language-switch-panel" class="language-switch-panel" aria-labelledby="language-switch-title">
+          <div>
+            <div id="language-switch-title" class="language-switch-title">Workspace Language</div>
+            <div id="language-switch-summary" class="language-switch-summary">R session, renv, coplot.R</div>
+          </div>
+          <div class="language-choice" role="radiogroup" aria-label="Workspace language">
+            <input id="setting-language-r" name="language" type="radio" value="r" checked />
+            <input id="setting-language-python" name="language" type="radio" value="python" />
+            <label class="language-choice-label" for="setting-language-r">R</label>
+            <button id="language-switch-toggle" class="language-switch" type="button" aria-label="Switch between R and Python">
+              <span class="language-switch-track" aria-hidden="true">
+                <span class="language-switch-thumb"></span>
+              </span>
+            </button>
+            <label class="language-choice-label" for="setting-language-python">Python</label>
+          </div>
+        </section>
         <div class="settings-grid">
           <div class="setting-with-action">
             <label>

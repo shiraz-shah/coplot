@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 
@@ -33,13 +33,12 @@ DEFAULTS_FILE = Path(os.environ.get("COPLOT_DEFAULTS_FILE", Path.home() / ".conf
 EDIT_BLOCK_RE = re.compile(r"```coplot-edit[ \t]*\n(?P<json>.*?)```", re.DOTALL | re.IGNORECASE)
 RUN_BLOCK_RE = re.compile(r"```coplot-run[ \t]*\n(?P<code>.*?)```", re.DOTALL | re.IGNORECASE)
 SHELL_BLOCK_RE = re.compile(r"```coplot-shell[ \t]*\n(?P<command>.*?)```", re.DOTALL | re.IGNORECASE)
-
 project: "ProjectState"
 chat_store: "ChatStore"
 transcript_store: "TranscriptStore"
 artifact_store: "ArtifactStore"
 model_settings_store: "ModelSettingsStore"
-python_session: "PythonSession"
+session: "ExecutionSession"
 shell_session: "ShellSession"
 context_builder: "ContextBuilder"
 agent_service: "AgentService"
@@ -65,6 +64,13 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return payload
+
+
+def file_mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return 0
 
 
 def apply_line_edits(source: str, edits: list[dict[str, Any]]) -> str:
@@ -140,16 +146,14 @@ def selection_for_line_edits(source: str, edits: list[dict[str, Any]]) -> dict[s
 @dataclass(frozen=True)
 class ProjectState:
     root: Path
-    source_file: Path
     agent_data_dir: Path
     summary_file: Path
     chat_file: Path
     transcript_file: Path
     artifacts_file: Path
     model_settings_file: Path
-    venv_dir: Path
-    venv_python: Path
     plots_dir: Path
+    language: str = "python"
 
     @classmethod
     def discover(cls, root: Path) -> "ProjectState":
@@ -157,45 +161,139 @@ class ProjectState:
         agent_data_dir = root / "coplot"
         return cls(
             root=root,
-            source_file=root / "coplot.py",
             agent_data_dir=agent_data_dir,
             summary_file=agent_data_dir / "summary.md",
             chat_file=agent_data_dir / "chat.jsonl",
             transcript_file=agent_data_dir / "transcript.jsonl",
             artifacts_file=agent_data_dir / "artifacts.jsonl",
             model_settings_file=agent_data_dir / "config.json",
-            venv_dir=agent_data_dir / "venv",
-            venv_python=agent_data_dir / "venv" / "bin" / "python",
             plots_dir=agent_data_dir / "plots",
         )
 
-    def ensure(self) -> None:
+    @property
+    def source_file(self) -> Path:
+        return self.root / ("coplot.R" if self.language == "r" else "coplot.py")
+
+    @property
+    def venv_dir(self) -> Path:
+        return self.agent_data_dir / "venv"
+
+    @property
+    def venv_python(self) -> Path:
+        return self.venv_dir / "bin" / "python"
+
+    @property
+    def renv_dir(self) -> Path:
+        return self.agent_data_dir / "renv"
+
+    @property
+    def renv_lock_file(self) -> Path:
+        return self.agent_data_dir / "renv.lock"
+
+    @property
+    def r_executable(self) -> str:
+        return shutil.which("Rscript") or "Rscript"
+
+    def with_language(self, language: str) -> "ProjectState":
+        return ProjectState(
+            root=self.root,
+            agent_data_dir=self.agent_data_dir,
+            summary_file=self.summary_file,
+            chat_file=self.chat_file,
+            transcript_file=self.transcript_file,
+            artifacts_file=self.artifacts_file,
+            model_settings_file=self.model_settings_file,
+            plots_dir=self.plots_dir,
+            language=normalize_language(language),
+        )
+
+    def ensure_base(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.agent_data_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
-        self.source_file.touch(exist_ok=True)
         if not self.summary_file.exists():
             self.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
         self.chat_file.touch(exist_ok=True)
         self.transcript_file.touch(exist_ok=True)
         self.artifacts_file.touch(exist_ok=True)
+
+    def ensure_runtime(self) -> None:
+        self.ensure_base()
+        self.ensure_source_file()
+        if self.language == "r":
+            self.ensure_renv()
+            return
         self.ensure_venv()
+
+    def ensure_source_file(self) -> None:
+        if self.source_file.exists():
+            return
+        if self.language == "r":
+            self.source_file.write_text(
+                "#!/usr/bin/env Rscript\n"
+                "\n"
+                "source(\"coplot/renv/activate.R\")\n",
+                encoding="utf-8",
+            )
+            return
+        self.source_file.touch()
 
     def ensure_venv(self) -> None:
         if self.venv_python.exists():
             return
         subprocess.run([sys.executable, "-m", "venv", str(self.venv_dir)], check=True)
 
-    def recreate_venv(self) -> None:
+    def ensure_renv(self) -> None:
+        executable = shutil.which("Rscript")
+        if executable is None:
+            raise RuntimeError("R mode requires Rscript on PATH.")
+        expression = (
+            "if (!requireNamespace('jsonlite', quietly = TRUE)) "
+            "stop('R mode requires the jsonlite package. Install it with install.packages(\"jsonlite\").'); "
+            "if (!requireNamespace('renv', quietly = TRUE)) "
+            "stop('R mode requires the renv package. Install it with install.packages(\"renv\").'); "
+            "lockfile <- 'coplot/renv.lock'; "
+            "if (!file.exists('coplot/renv/activate.R')) "
+            "renv::init(project = getwd(), bare = TRUE, restart = FALSE, settings = list(external.libraries = character())); "
+            "source('coplot/renv/activate.R'); "
+            "renv::install('jsonlite'); "
+            "renv::snapshot(project = getwd(), lockfile = lockfile, prompt = FALSE); "
+            "renv::record(list(jsonlite = list(Package = 'jsonlite', Version = as.character(utils::packageVersion('jsonlite')), Source = 'Repository', Repository = 'CRAN')), lockfile = lockfile, project = getwd())"
+        )
+        env = self._renv_env()
+        subprocess.run([executable, "--vanilla", "-e", expression], cwd=self.root, env=env, check=True)
+
+    def _renv_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["RENV_PATHS_RENV"] = "coplot/renv"
+        env["RENV_PATHS_LIBRARY"] = str(self.renv_dir / "library")
+        env["RENV_PATHS_LOCKFILE"] = "coplot/renv.lock"
+        return env
+
+    def recreate_runtime(self) -> None:
+        if self.language == "r":
+            self.ensure_renv()
+            return
         if self.venv_dir.exists():
             shutil.rmtree(self.venv_dir)
         self.ensure_venv()
+
+
+def normalize_language(value: Any) -> str:
+    language = str(value or "python").strip().lower()
+    if language in {"py", "python"}:
+        return "python"
+    if language in {"r", "R"}:
+        return "r"
+    raise ValueError("language must be either 'python' or 'r'")
 
 
 def default_model_settings() -> dict[str, Any]:
     return {
         "endpoint_url": "http://localhost:11434",
         "model": "qwen3.5:2b",
+        "language": "r",
+        "workspace_setup_complete": False,
         "max_tokens": 8192,
         "temperature": 0.2,
         "reasoning_enabled": False,
@@ -214,6 +312,8 @@ class ModelSettingsStore:
         settings = default_model_settings()
         if self.defaults_path.exists():
             stored_defaults = json.loads(self.defaults_path.read_text(encoding="utf-8") or "{}")
+            stored_defaults.pop("language", None)
+            stored_defaults.pop("workspace_setup_complete", None)
             settings.update({key: value for key, value in stored_defaults.items() if value is not None})
         if self.path.exists():
             stored = json.loads(self.path.read_text(encoding="utf-8") or "{}")
@@ -232,11 +332,17 @@ class ModelSettingsStore:
         return self.read()
 
     def write_defaults(self, values: dict[str, Any]) -> dict[str, Any]:
+        values = dict(values)
+        values.pop("language", None)
+        values.pop("workspace_setup_complete", None)
         current = default_model_settings()
         if self.defaults_path.exists():
             stored = json.loads(self.defaults_path.read_text(encoding="utf-8") or "{}")
+            stored.pop("language", None)
+            stored.pop("workspace_setup_complete", None)
             current.update({key: value for key, value in stored.items() if value is not None})
         current = self._clean({**current, **values})
+        current["workspace_setup_complete"] = False
         self.defaults_path.parent.mkdir(parents=True, exist_ok=True)
         self.defaults_path.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return current
@@ -253,6 +359,8 @@ class ModelSettingsStore:
             if key in allowed:
                 current[key] = value
         current["max_tokens"] = max(1, int(current["max_tokens"]))
+        current["language"] = normalize_language(current.get("language", "python"))
+        current["workspace_setup_complete"] = bool(current.get("workspace_setup_complete"))
         current["temperature"] = float(current["temperature"])
         current["reasoning_enabled"] = bool(current["reasoning_enabled"])
         current["reasoning_control"] = str(current.get("reasoning_control") or "auto")
@@ -593,7 +701,19 @@ class ActiveJobStore:
             self._jobs.clear()
 
 
+class ExecutionSession(Protocol):
+    language: str
+
+    def clear(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def execute(self, code: str, *, source: str, interactive: bool = False) -> dict[str, Any]: ...
+
+
 class PythonSession:
+    language = "python"
+
     def __init__(
         self,
         project: ProjectState,
@@ -654,7 +774,7 @@ class PythonSession:
         return env
 
     def execute(self, code: str, *, source: str, interactive: bool = False) -> dict[str, Any]:
-        job_id = self.active_jobs.begin(kind="session", language="python", source=source, input_text=code)
+        job_id = self.active_jobs.begin(kind="session", language=self.language, source=source, input_text=code)
         start = time.perf_counter()
         try:
             before_pngs = self._png_snapshot()
@@ -667,7 +787,7 @@ class PythonSession:
             generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
             duration_ms = int((time.perf_counter() - start) * 1000)
             entry = self.transcript.append_session(
-                language="python",
+                language=self.language,
                 source=source,
                 code=code,
                 stdout=str(response.get("stdout", "")),
@@ -726,6 +846,134 @@ class PythonSession:
             return {"stdout": "", "stderr": f"Python session worker stopped.\n{stderr}", "ok": False, "artifacts": []}
         return json.loads(line)
 
+
+class RSession:
+    language = "r"
+
+    def __init__(
+        self,
+        project: ProjectState,
+        transcript: TranscriptStore,
+        artifacts: ArtifactStore,
+        active_jobs: ActiveJobStore,
+        plots_dir: Path,
+    ) -> None:
+        self.project = project
+        self.transcript = transcript
+        self.artifacts = artifacts
+        self.active_jobs = active_jobs
+        self.plots_dir = plots_dir
+        self.process: subprocess.Popen[str] | None = None
+
+    def clear(self) -> None:
+        self.stop()
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=3)
+        self.process = None
+
+    def _ensure_worker(self) -> subprocess.Popen[str]:
+        if self.process is not None and self.process.poll() is None:
+            return self.process
+        self.project.ensure_runtime()
+        env = self.project._renv_env()
+        self.process = subprocess.Popen(
+            [
+                self.project.r_executable,
+                "--vanilla",
+                str(Path(__file__).resolve().parent / "r_session_worker.R"),
+                "--plots-dir",
+                str(self.plots_dir),
+            ],
+            cwd=self.project.root,
+            env=env,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return self.process
+
+    def execute(self, code: str, *, source: str, interactive: bool = False) -> dict[str, Any]:
+        job_id = self.active_jobs.begin(kind="session", language=self.language, source=source, input_text=code)
+        start = time.perf_counter()
+        try:
+            before_pngs = self._png_snapshot()
+            response = self._send_worker_request(
+                {
+                    "code": code,
+                    "interactive": interactive,
+                }
+            )
+            generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            entry = self.transcript.append_session(
+                language=self.language,
+                source=source,
+                code=code,
+                stdout=str(response.get("stdout", "")),
+                stderr=str(response.get("stderr", "")),
+                ok=bool(response.get("ok")),
+                duration_ms=duration_ms,
+                artifacts=generated_artifacts,
+            )
+            return {"entry": entry, "artifacts": generated_artifacts}
+        finally:
+            self.active_jobs.finish(job_id)
+
+    def _png_snapshot(self) -> dict[Path, tuple[int, int]]:
+        snapshot: dict[Path, tuple[int, int]] = {}
+        root = self.project.plots_dir.resolve()
+        if not root.exists():
+            return snapshot
+        for path in root.rglob("*"):
+            if path.suffix.lower() != ".png" or not path.is_file():
+                continue
+            resolved = path.resolve()
+            stat = resolved.stat()
+            snapshot[resolved] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
+
+    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]], code: str) -> list[dict[str, Any]]:
+        after = self._png_snapshot()
+        changed_paths = [
+            path
+            for path, signature in after.items()
+            if before.get(path) != signature
+        ]
+        generated = []
+        for path in sorted(changed_paths):
+            generated.append(
+                self.artifacts.upsert_path(
+                    artifact_type="plot",
+                    path=path,
+                    source="session",
+                    code=code,
+                    caption=path.name,
+                )
+            )
+        return generated
+
+    def _send_worker_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        process = self._ensure_worker()
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("R session worker pipes are unavailable")
+        process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        if not line:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            self.process = None
+            return {"stdout": "", "stderr": f"R session worker stopped.\n{stderr}", "ok": False, "artifacts": []}
+        return json.loads(line)
+
 class ShellSession:
     def __init__(self, project: ProjectState, transcript: TranscriptStore, active_jobs: ActiveJobStore, cwd: Path) -> None:
         self.project = project
@@ -735,12 +983,13 @@ class ShellSession:
 
     def execute(self, command: str, *, source: str = "user_shell") -> dict[str, Any]:
         job_id = self.active_jobs.begin(kind="shell", source=source, input_text=command)
-        self.project.ensure_venv()
+        self.project.ensure_runtime()
         env = os.environ.copy()
-        bin_dir = str(self.project.venv_dir / "bin")
-        env["VIRTUAL_ENV"] = str(self.project.venv_dir)
-        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
-        env.pop("PYTHONHOME", None)
+        if self.project.language == "python":
+            bin_dir = str(self.project.venv_dir / "bin")
+            env["VIRTUAL_ENV"] = str(self.project.venv_dir)
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env.pop("PYTHONHOME", None)
         start = time.perf_counter()
         try:
             completed = subprocess.run(
@@ -776,14 +1025,15 @@ class ContextBuilder:
         self.artifacts = artifacts
 
     def payload(self, current_request: str = "") -> dict[str, Any]:
-        code = self.project.source_file.read_text(encoding="utf-8")
+        code = self.project.source_file.read_text(encoding="utf-8") if self.project.source_file.exists() else ""
         numbered_code = "\n".join(f"{idx:4d}: {line}" for idx, line in enumerate(code.splitlines(), start=1))
         artifact_entries = self.artifacts.list()
+        environment = self.environment_payload()
         return {
             "current_user_request": current_request,
             "durable_code": {
                 "path": self.project.source_file.name,
-                "language": "python",
+                "language": self.project.language,
                 "numbered": numbered_code,
             },
             "session_summary": self.project.summary_file.read_text(encoding="utf-8"),
@@ -793,13 +1043,30 @@ class ContextBuilder:
                 "recent": artifact_entries[-20:],
                 "pinned": [entry for entry in artifact_entries if entry.get("pinned")],
             },
-            "environment": {
+            "environment": environment,
+        }
+
+    def environment_payload(self) -> dict[str, Any]:
+        if self.project.language == "r":
+            return {
                 "project_root": str(self.project.root),
-                "language": "python",
-                "python_executable": str(self.project.venv_python),
-                "python_venv": str(self.project.venv_dir),
-                "package_install_hint": "Use python -m pip install ... or pip install ...; shell PATH points at the project venv.",
-            },
+                "language": "r",
+                "r_executable": self.project.r_executable,
+                "r_renv": str(self.project.renv_dir),
+                "r_renv_lockfile": str(self.project.renv_lock_file),
+                "package_install_hint": (
+                    "Use renv::install(...) for project packages, prefer GitHub sources for "
+                    "Bioconductor-style packages when available, then run "
+                    "renv::snapshot(lockfile = 'coplot/renv.lock', prompt = FALSE). "
+                    "R mode requires renv and jsonlite."
+                ),
+            }
+        return {
+            "project_root": str(self.project.root),
+            "language": "python",
+            "python_executable": str(self.project.venv_python),
+            "python_venv": str(self.project.venv_dir),
+            "package_install_hint": "Use python -m pip install ... or pip install ...; shell PATH points at the project venv.",
         }
 
 
@@ -809,7 +1076,7 @@ class AgentService:
         project: ProjectState,
         chat: ChatStore,
         context_builder: ContextBuilder,
-        session: PythonSession,
+        session: ExecutionSession,
         shell: ShellSession,
         settings: ModelSettingsStore,
     ) -> None:
@@ -853,36 +1120,7 @@ class AgentService:
         context = self.context_builder.payload(message)
         if action_feedback:
             context["action_feedback"] = action_feedback
-        prompt = (
-            "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
-            "session scratch work, shell commands, and artifacts clearly separated.\n\n"
-            "When durable code should change, emit a fenced coplot-edit JSON block for "
-            "coplot.py. The block must be a JSON list of edits using 1-based line "
-            "numbers against the current editor contents. end_line is inclusive:\n"
-            "```coplot-edit\n"
-            "[{\"start_line\": 1, \"end_line\": 1, \"replacement\": \"print('new code')\\n\"}]\n"
-            "```\n"
-            "Use start_line N and end_line 0 to insert before line N. Use start_line 0 "
-            "and end_line 0 to insert at the beginning of an empty file. "
-            "When you need ad hoc Python inspection in the shared live session, emit:\n"
-            "```coplot-run\n"
-            "print(df.shape)\n"
-            "```\n"
-            "When you need an ad hoc shell command, emit:\n"
-            "```coplot-shell\n"
-            "python -m pip show pandas\n"
-            "```\n"
-            "Use durable edits for reproducible work, session runs for scratch Python, and shell "
-            "commands for package or system checks. The Python session and shell both use the "
-            "project venv; install Python packages with python -m pip install ... so they land "
-            "in that environment. The user will often ask you to visually inspect plots for "
-            "feedback. You can only see plots if they have been saved as PNG files in the "
-            "./coplot/plots/ folder. Therefore, always save plots as PNG files in ./coplot/plots/. Calling "
-            "plt.show() may show a plot to the user in their local environment, but it does "
-            "not make the plot visible to you. If plot images are attached to the user message, inspect the "
-            "image directly instead of saying you cannot see it.\n\n"
-            f"Context payload:\n{json.dumps(context, ensure_ascii=False)}"
-        )
+        prompt = self._system_prompt(context)
         user_content = self._user_content(message)
         payload = {
             "model": model,
@@ -911,6 +1149,80 @@ class AgentService:
         assistant = self.chat.append("assistant", content)
         actions = self._run_actions(content)
         return {"message": assistant, "actions": actions}
+
+    def _system_prompt(self, context: dict[str, Any]) -> str:
+        edit_example = (
+            "[{\"start_line\": 1, \"end_line\": 1, \"replacement\": \"print('new code')\\n\"}]"
+            if self.project.language == "python"
+            else "[{\"start_line\": 1, \"end_line\": 1, \"replacement\": \"print('new code')\\n\"}]"
+        )
+        if self.project.language == "r":
+            run_example = "print(dim(df))"
+            shell_example = "Rscript -e \"renv::status()\""
+            runtime_rules = (
+                "When you need ad hoc R inspection in the shared live session, emit:\n"
+                "```coplot-run\n"
+                f"{run_example}\n"
+                "```\n"
+                "When you need an ad hoc shell command, emit:\n"
+                "```coplot-shell\n"
+                f"{shell_example}\n"
+                "```\n"
+                "Use durable edits for reproducible work, session runs for scratch R, and shell "
+                "commands for package or system checks. The R session runs from the project root "
+                "with renv initialized. Install R packages with renv::install(...) so they land "
+                "in ./coplot/renv/. Do not use install.packages(), BiocManager::install(), "
+                "devtools, or remotes unless the user explicitly asks or renv::install(...) cannot "
+                "handle the source. Prefer GitHub sources for Bioconductor-style packages when "
+                "available, for example renv::install(\"joey711/phyloseq\"). After installing or "
+                "upgrading R packages, run renv::snapshot(lockfile = \"coplot/renv.lock\", prompt = FALSE) "
+                "to update ./coplot/renv.lock. "
+                "R mode requires renv and jsonlite. Save plots as PNG files in ./coplot/plots/ using png(...), "
+                "ggsave(...), or another explicit file-writing API. Calling plot viewers or relying "
+                "on an interactive device does not make plots visible to you."
+            )
+        else:
+            run_example = "print(df.shape)"
+            shell_example = "python -m pip show pandas"
+            runtime_rules = (
+                "When you need ad hoc Python inspection in the shared live session, emit:\n"
+                "```coplot-run\n"
+                f"{run_example}\n"
+                "```\n"
+                "When you need an ad hoc shell command, emit:\n"
+                "```coplot-shell\n"
+                f"{shell_example}\n"
+                "```\n"
+                "Use durable edits for reproducible work, session runs for scratch Python, and shell "
+                "commands for package or system checks. The Python session and shell both use the "
+                "project venv; install Python packages with python -m pip install ... so they land "
+                "in that environment. Save plots as PNG files in ./coplot/plots/. Calling plt.show() "
+                "may show a plot to the user in their local environment, but it does not make the "
+                "plot visible to you."
+            )
+        return (
+            "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
+            "session scratch work, shell commands, and artifacts clearly separated. This workspace "
+            f"is locked to {self.project.language.upper() if self.project.language == 'r' else 'Python'}; "
+            "do not switch languages or add language names to coplot action fences.\n\n"
+            "When durable code should change, emit a fenced coplot-edit JSON block for "
+            f"{self.project.source_file.name}. The block must be a JSON list of edits using 1-based line "
+            "numbers against the current editor contents. end_line is inclusive:\n"
+            "```coplot-edit\n"
+            f"{edit_example}\n"
+            "```\n"
+            "Use start_line N and end_line 0 to insert before line N. Use start_line 0 "
+            "and end_line 0 to insert at the beginning of an empty file. "
+            "Use coplot-run freely for exploration and checks. But whenever code creates useful "
+            "analysis state, such as loaded data, transformed data, models, helper functions, "
+            "or plot code, also update the durable source with coplot-edit. The durable file "
+            "should be able to recreate the important state from a fresh session. "
+            f"{runtime_rules} The user will often ask you to visually inspect plots for feedback. "
+            "You can only see plots if they have been saved as PNG files in the ./coplot/plots/ folder. "
+            "If plot images are attached to the user message, inspect the image directly instead of saying "
+            "you cannot see it.\n\n"
+            f"Context payload:\n{json.dumps(context, ensure_ascii=False)}"
+        )
 
     def _actions_need_followup(self, actions: list[dict[str, Any]]) -> bool:
         if not actions:
@@ -1049,33 +1361,74 @@ def configure_app(workspace_root: Path) -> None:
     global transcript_store
     global artifact_store
     global model_settings_store
-    global python_session
+    global session
     global shell_session
     global context_builder
     global agent_service
     global active_job_store
     global workspace_first_run
 
-    project = ProjectState.discover(workspace_root)
-    workspace_first_run = not project.model_settings_file.exists()
-    project.ensure()
+    discovered = ProjectState.discover(workspace_root)
+    discovered.ensure_base()
+    model_settings_store = ModelSettingsStore(discovered.model_settings_file, DEFAULTS_FILE)
+    model_settings_store.ensure_workspace_config()
+    settings = model_settings_store.read()
+    language = infer_workspace_language(discovered, settings)
+    project = discovered.with_language(language)
+    workspace_first_run = not is_workspace_setup_complete(discovered, settings, language)
+    if not workspace_first_run:
+        model_settings_store.write({"language": language, "workspace_setup_complete": True})
+        project.source_file.touch(exist_ok=True)
     chat_store = ChatStore(project.chat_file)
     transcript_store = TranscriptStore(project.transcript_file)
     artifact_store = ArtifactStore(project.artifacts_file, project.root)
     active_job_store = ActiveJobStore()
-    model_settings_store = ModelSettingsStore(project.model_settings_file, DEFAULTS_FILE)
-    model_settings_store.ensure_workspace_config()
-    python_session = PythonSession(project, transcript_store, artifact_store, active_job_store, project.plots_dir)
+    configure_runtime_services()
+
+
+def infer_workspace_language(project_state: ProjectState, settings: dict[str, Any]) -> str:
+    language = normalize_language(settings.get("language", "python"))
+    if bool(settings.get("workspace_setup_complete")):
+        return language
+    if (project_state.root / "coplot.R").exists() and not (project_state.root / "coplot.py").exists():
+        return "r"
+    return language
+
+
+def is_workspace_setup_complete(project_state: ProjectState, settings: dict[str, Any], language: str) -> bool:
+    if bool(settings.get("workspace_setup_complete")):
+        return True
+    if not project_state.model_settings_file.exists():
+        return False
+    source_file = project_state.root / ("coplot.R" if language == "r" else "coplot.py")
+    if source_file.exists():
+        return True
+    return (project_state.root / "coplot.py").exists() or (project_state.root / "coplot.R").exists()
+
+
+def configure_runtime_services() -> None:
+    global session
+    global shell_session
+    global context_builder
+    global agent_service
+
+    session = create_execution_session(project)
     shell_session = ShellSession(project, transcript_store, active_job_store, project.root)
     context_builder = ContextBuilder(project, chat_store, transcript_store, artifact_store)
     agent_service = AgentService(
         project,
         chat_store,
         context_builder,
-        python_session,
+        session,
         shell_session,
         model_settings_store,
     )
+
+
+def create_execution_session(project_state: ProjectState) -> ExecutionSession:
+    if project_state.language == "r":
+        return RSession(project_state, transcript_store, artifact_store, active_job_store, project_state.plots_dir)
+    return PythonSession(project_state, transcript_store, artifact_store, active_job_store, project_state.plots_dir)
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1189,15 +1542,20 @@ class Handler(SimpleHTTPRequestHandler):
             "project": {
                 "root": str(project.root),
                 "source_file": project.source_file.name,
+                "language": project.language,
                 "runtime": "stdlib-http",
                 "shell": "command-by-command",
-                "venv": str(project.venv_dir),
-                "python": str(project.venv_python),
+                "venv": str(project.venv_dir) if project.language == "python" else None,
+                "python": str(project.venv_python) if project.language == "python" else None,
+                "renv": str(project.renv_dir) if project.language == "r" else None,
+                "renv_lockfile": str(project.renv_lock_file) if project.language == "r" else None,
+                "r": project.r_executable if project.language == "r" else None,
                 "model_settings_file": str(model_settings_store.path),
                 "defaults_file": str(model_settings_store.defaults_path),
                 "first_run": workspace_first_run,
             },
-            "source": project.source_file.read_text(encoding="utf-8"),
+            "source": project.source_file.read_text(encoding="utf-8") if project.source_file.exists() else "",
+            "source_mtime_ns": file_mtime_ns(project.source_file),
             "chat": chat_store.recent(100),
             "transcript": transcript_store.recent(100),
             "active_jobs": active_job_store.list(),
@@ -1218,30 +1576,29 @@ class Handler(SimpleHTTPRequestHandler):
     def run_file(self, body: dict[str, Any]) -> None:
         source = str(body.get("source", project.source_file.read_text(encoding="utf-8")))
         project.source_file.write_text(source, encoding="utf-8")
-        result = python_session.execute(source, source="durable_script")
+        result = session.execute(source, source="durable_script")
         self.send_json({"result": result, "state": self.state()})
 
     def run_session(self, body: dict[str, Any]) -> None:
         code = str(body.get("code", ""))
-        result = python_session.execute(code, source=str(body.get("source", "user_executed")), interactive=True)
+        result = session.execute(code, source=str(body.get("source", "user_executed")), interactive=True)
         self.send_json({"result": result, "state": self.state()})
 
     def clear_session(self, body: dict[str, Any]) -> None:
-        python_session.clear()
+        session.clear()
         active_job_store.clear()
         project.source_file.write_text("", encoding="utf-8")
         project.chat_file.write_text("", encoding="utf-8")
         project.transcript_file.write_text("", encoding="utf-8")
         artifact_store.clear()
         self.clear_artifact_files()
-        project.recreate_venv()
+        project.recreate_runtime()
         self.send_json({"result": {"ok": True, "message": "Workspace cleared."}, "state": self.state()})
 
     def clear_context(self, body: dict[str, Any]) -> None:
-        project.chat_file.write_text("", encoding="utf-8")
         project.transcript_file.write_text("", encoding="utf-8")
         project.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
-        self.send_json({"result": {"ok": True, "message": "Context cleared."}, "state": self.state()})
+        self.send_json({"result": {"ok": True, "message": "Transcript context cleared."}, "state": self.state()})
 
     def clear_artifact_files(self) -> None:
         root = project.plots_dir.resolve()
@@ -1266,6 +1623,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"result": {"ok": True, "message": "Stop requested."}, "state": self.state()})
 
     def save_model_settings(self, body: dict[str, Any]) -> None:
+        if "language" in body and normalize_language(body["language"]) != project.language:
+            return self.send_json({"error": "Workspace language cannot be changed after setup."}, status=400)
         settings = model_settings_store.write(body)
         self.send_json({"model_settings": settings, "state": self.state()})
 
@@ -1274,8 +1633,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"model_settings": settings, "state": self.state()})
 
     def proceed_model_settings(self, body: dict[str, Any]) -> None:
+        global project
         global workspace_first_run
-        settings = model_settings_store.write(body)
+        language = normalize_language(body.get("language", model_settings_store.read().get("language", "python")))
+        if not workspace_first_run and language != project.language:
+            return self.send_json({"error": "Workspace language cannot be changed after setup."}, status=400)
+        project = ProjectState.discover(project.root).with_language(language)
+        project.ensure_runtime()
+        configure_runtime_services()
+        settings = model_settings_store.write({**body, "language": language, "workspace_setup_complete": True})
         workspace_first_run = False
         self.send_json({"model_settings": settings, "state": self.state()})
 
@@ -1326,7 +1692,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         server.serve_forever()
     finally:
-        python_session.stop()
+        session.stop()
 
 
 if __name__ == "__main__":

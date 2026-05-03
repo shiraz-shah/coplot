@@ -4,11 +4,14 @@ coplot_data/
 plots/
 analysis.py
 coplot/venv/
+coplot/renv/
+coplot/renv.lock
 coplot/plots/
 coplot/*.jsonl
 coplot/summary.md
 coplot/config.json
 coplot.py
+coplot.R
 
 # Local analysis environments and Python caches
 .venv/

@@ -10,12 +10,15 @@ const state = {
   settingsFirstRun: false,
   editorDirty: false,
   lastServerSource: "",
+  lastSourceMtimeNs: 0,
   endpointModels: [],
   pendingPollTimer: null,
   pendingChatBaselineLength: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
+const PENDING_POLL_INTERVAL_MS = 5000;
+const AUTO_SCROLL_THRESHOLD_PX = 32;
 
 function setStatus(text) {
   $("#status").textContent = text;
@@ -46,12 +49,17 @@ async function refresh() {
 
 function render(options = {}) {
   const data = state.data;
+  updateLanguageTheme();
   $("#project-root").textContent = data.project.root;
   $("#source-name").textContent = data.project.source_file;
+  updateRuntimeLabels();
   renderContextMeter(data.context_usage);
-  if (options.forceSource || (!state.editorDirty && document.activeElement !== $("#source-editor"))) {
+  const sourceMtimeNs = Number(data.source_mtime_ns || 0);
+  const staleSource = sourceMtimeNs > 0 && sourceMtimeNs < state.lastSourceMtimeNs;
+  if (!staleSource && (options.forceSource || (!state.editorDirty && document.activeElement !== $("#source-editor")))) {
     setEditorValue(data.source);
     state.lastServerSource = data.source;
+    state.lastSourceMtimeNs = sourceMtimeNs;
     if (options.forceSource) state.editorDirty = false;
   }
   renderChat(data.chat);
@@ -85,9 +93,12 @@ function renderContextMeter(usage) {
 
 function renderChat(entries) {
   const log = $("#chat-log");
+  const shouldStickToBottom = shouldAutoScrollToBottom(log);
+  const previousScrollTop = log.scrollTop;
   log.innerHTML = "";
   if (!entries.length && !state.chatPending && !state.pendingChatMessage) {
     log.innerHTML = '<div class="empty">No chat yet.</div>';
+    restoreScrollPosition(log, shouldStickToBottom, previousScrollTop);
     return;
   }
   for (const entry of entries) {
@@ -106,7 +117,19 @@ function renderChat(entries) {
   if (state.chatPending) {
     log.appendChild(renderTypingMessage());
   }
-  log.scrollTop = log.scrollHeight;
+  restoreScrollPosition(log, shouldStickToBottom, previousScrollTop);
+}
+
+function shouldAutoScrollToBottom(element) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= AUTO_SCROLL_THRESHOLD_PX;
+}
+
+function restoreScrollPosition(element, shouldStickToBottom, previousScrollTop) {
+  if (shouldStickToBottom) {
+    element.scrollTop = element.scrollHeight;
+    return;
+  }
+  element.scrollTop = previousScrollTop;
 }
 
 function shouldRenderPendingUserMessage(entries) {
@@ -142,10 +165,13 @@ function renderTypingMessage() {
 
 function renderTranscript(entries, activeJobs = []) {
   const transcript = $("#transcript");
+  const shouldStickToBottom = shouldAutoScrollToBottom(transcript);
+  const previousScrollTop = transcript.scrollTop;
   transcript.innerHTML = "";
   const localPending = pendingTranscriptEntries(activeJobs);
   if (!entries.length && !activeJobs.length && !localPending.length) {
     transcript.innerHTML = '<div class="empty">Run durable code, session snippets, or shell commands to create transcript entries.</div>';
+    restoreScrollPosition(transcript, shouldStickToBottom, previousScrollTop);
     return;
   }
   for (const entry of entries) {
@@ -170,7 +196,7 @@ function renderTranscript(entries, activeJobs = []) {
   for (const pending of localPending) {
     transcript.appendChild(renderPendingTranscriptEntry(pending));
   }
-  transcript.scrollTop = transcript.scrollHeight;
+  restoreScrollPosition(transcript, shouldStickToBottom, previousScrollTop);
 }
 
 function pendingTranscriptEntries(activeJobs = []) {
@@ -237,6 +263,7 @@ function sortedPlotArtifacts(artifacts) {
 function renderModelSettings(settings) {
   $("#setting-endpoint-url").value = settings.endpoint_url || "http://localhost:11434";
   populateModelOptions(settings.model || "qwen3.5:2b");
+  setLanguageSelection(settings.language || state.data?.project?.language || "r");
   $("#setting-max-tokens").value = settings.max_tokens || 8192;
   $("#setting-context-window").value = settings.context_window_tokens || 32768;
   $("#setting-temperature").value = settings.temperature ?? 0.2;
@@ -249,6 +276,7 @@ function readModelSettingsForm() {
   return {
     endpoint_url: $("#setting-endpoint-url").value.trim(),
     model: $("#setting-model").value.trim(),
+    language: selectedSettingsLanguage(),
     max_tokens: Number($("#setting-max-tokens").value),
     context_window_tokens: Number($("#setting-context-window").value),
     temperature: Number($("#setting-temperature").value),
@@ -286,6 +314,39 @@ function setSettingsMessage(message, isError = false) {
   element.classList.toggle("error", isError);
 }
 
+function selectedSettingsLanguage() {
+  return document.querySelector("input[name='language']:checked")?.value || "r";
+}
+
+function setLanguageSelection(language) {
+  const normalized = language === "python" ? "python" : "r";
+  const input = $(`#setting-language-${normalized}`);
+  if (input) input.checked = true;
+  updateLanguageSwitchSummary(normalized);
+  updateLanguageTheme(normalized);
+}
+
+function setLanguageSwitchDisabled(disabled) {
+  document.querySelectorAll("input[name='language']").forEach((input) => {
+    input.disabled = disabled;
+  });
+  $("#language-switch-toggle").disabled = disabled;
+}
+
+function updateLanguageSwitchSummary(language = selectedSettingsLanguage()) {
+  const summary = $("#language-switch-summary");
+  if (!summary) return;
+  summary.textContent = language === "python"
+    ? "Python session, venv, coplot.py"
+    : "R session, renv, coplot.R";
+}
+
+function updateLanguageTheme(language = currentLanguage()) {
+  const normalized = language === "python" ? "python" : "r";
+  document.body.classList.toggle("language-python", normalized === "python");
+  document.body.classList.toggle("language-r", normalized === "r");
+}
+
 function openSettingsDialog({ firstRun = false } = {}) {
   state.settingsFirstRun = firstRun;
   state.settingsDialogShown = true;
@@ -296,7 +357,10 @@ function openSettingsDialog({ firstRun = false } = {}) {
     ? "Save these settings for this workspace and enter coplot"
     : "Save these settings for this workspace";
   $("#close-model-settings").hidden = firstRun;
-  setSettingsMessage(firstRun ? "Connect to your local model server, choose a model, then proceed." : "");
+  setLanguageSwitchDisabled(!firstRun);
+  $("#language-switch-panel").classList.toggle("locked", !firstRun);
+  $("#language-switch-panel").title = firstRun ? "" : "Workspace language is locked after setup.";
+  setSettingsMessage(firstRun ? "Choose a language, connect to your local model server, choose a model, then proceed." : "");
   $("#model-settings-dialog").showModal();
 }
 
@@ -393,7 +457,7 @@ function startPendingPoll() {
     } catch (error) {
       setStatus(error.message);
     }
-  }, 1200);
+  }, PENDING_POLL_INTERVAL_MS);
 }
 
 function stopPendingPoll() {
@@ -418,6 +482,7 @@ async function postAndRefresh(path, body, options = {}) {
     if (options.savedSource !== undefined) {
       state.editorDirty = false;
       state.lastServerSource = options.savedSource;
+      state.lastSourceMtimeNs = Number(state.data?.source_mtime_ns || state.lastSourceMtimeNs || 0);
     }
     state.chatPending = false;
     state.pendingChatMessage = "";
@@ -486,7 +551,7 @@ async function runSelectedEditorCode() {
 
 function updateSourceHighlight() {
   const editor = $("#source-editor");
-  $("#source-highlight").innerHTML = highlightPython(editor.value);
+  $("#source-highlight").innerHTML = highlightSource(editor.value);
   updateLineNumbers();
   updateCurrentLineHighlight();
 }
@@ -517,6 +582,42 @@ function updateCurrentLineHighlight() {
   highlight.style.height = `${lineHeight}px`;
 }
 
+function currentLanguage() {
+  return state.data?.project?.language || state.data?.model_settings?.language || "r";
+}
+
+function languageShortLabel() {
+  return currentLanguage() === "r" ? "R" : "py";
+}
+
+function languageDisplayName() {
+  return currentLanguage() === "r" ? "R" : "Python";
+}
+
+function sessionPlaceholder() {
+  return currentLanguage() === "r" ? "head(df)" : "print(df.head())";
+}
+
+function shellPlaceholder() {
+  return currentLanguage() === "r" ? 'Rscript -e "renv::status()"' : "python3 -m pip install pandas";
+}
+
+function updateRuntimeLabels() {
+  const languageName = languageDisplayName();
+  const sourceName = state.data?.project?.source_file || (currentLanguage() === "r" ? "coplot.R" : "coplot.py");
+  $("#save-source").title = `Save ${sourceName}`;
+  $("#save-source").setAttribute("aria-label", `Save ${sourceName}`);
+  $("#session-title").textContent = state.mode === "session" ? `${languageName} session` : "Shell command";
+  $("#mode-session").textContent = languageShortLabel();
+  $("#mode-session").title = `${languageName} session`;
+  $("#mode-session").setAttribute("aria-label", `${languageName} session`);
+  $("#command-input").placeholder = state.mode === "session" ? sessionPlaceholder() : shellPlaceholder();
+}
+
+function highlightSource(source) {
+  return currentLanguage() === "r" ? highlightR(source) : highlightPython(source);
+}
+
 function highlightPython(source) {
   const lines = source.split("\n").map((line) => {
     const commentIndex = line.indexOf("#");
@@ -525,6 +626,30 @@ function highlightPython(source) {
     return `${highlightPythonCode(code)}${comment ? `<span class="tok-comment">${escapeHtml(comment)}</span>` : ""}`;
   });
   return `${lines.join("\n")}\n`;
+}
+
+function highlightR(source) {
+  const lines = source.split("\n").map((line) => {
+    const commentIndex = line.indexOf("#");
+    const code = commentIndex >= 0 ? line.slice(0, commentIndex) : line;
+    const comment = commentIndex >= 0 ? line.slice(commentIndex) : "";
+    return `${highlightRCode(code)}${comment ? `<span class="tok-comment">${escapeHtml(comment)}</span>` : ""}`;
+  });
+  return `${lines.join("\n")}\n`;
+}
+
+function highlightRCode(source) {
+  const strings = [];
+  let html = source.replace(/("[^"\n]*(?:\\.[^"\n]*)*"|'[^'\n]*(?:\\.[^'\n]*)*')/g, (match) => {
+    const index = strings.push(match) - 1;
+    return `___DSSTR${placeholderKey(index)}___`;
+  });
+  html = escapeHtml(html);
+  html = html.replace(/\b(FALSE|TRUE|NULL|NA|NaN|Inf|if|else|repeat|while|function|for|in|next|break|library|require)\b/g, '<span class="tok-keyword">$1</span>');
+  html = html.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="tok-number">$1</span>');
+  html = html.replace(/\b([A-Za-z.][A-Za-z0-9._]*)\s*(?=\()/g, '<span class="tok-call">$1</span>');
+  html = html.replace(/___DSSTR([A-Z]+)___/g, (_, key) => `<span class="tok-string">${escapeHtml(strings[placeholderIndex(key)])}</span>`);
+  return html;
 }
 
 function highlightPythonCode(source) {
@@ -600,24 +725,22 @@ $("#mode-session").addEventListener("click", () => {
   state.mode = "session";
   $("#mode-session").classList.add("active");
   $("#mode-shell").classList.remove("active");
-  $("#session-title").textContent = "Python session";
-  $("#command-input").placeholder = "print(df.head())";
   $("#command-form").classList.add("session-command");
   $("#command-form").classList.remove("shell-command");
   $(".session-pane").classList.add("python-mode");
   $(".session-pane").classList.remove("shell-mode");
+  updateRuntimeLabels();
 });
 
 $("#mode-shell").addEventListener("click", () => {
   state.mode = "shell";
   $("#mode-shell").classList.add("active");
   $("#mode-session").classList.remove("active");
-  $("#session-title").textContent = "Shell command";
-  $("#command-input").placeholder = "python3 -m pip install pandas";
   $("#command-form").classList.add("shell-command");
   $("#command-form").classList.remove("session-command");
   $(".session-pane").classList.add("shell-mode");
   $(".session-pane").classList.remove("python-mode");
+  updateRuntimeLabels();
 });
 
 $("#clear-session").addEventListener("click", async () => {
@@ -743,6 +866,20 @@ $("#setting-model").addEventListener("change", () => {
   if (contextWindow) $("#setting-context-window").value = contextWindow;
 });
 
+document.querySelectorAll("input[name='language']").forEach((input) => {
+  input.addEventListener("change", () => {
+    if (!input.checked) return;
+    updateLanguageSwitchSummary(input.value);
+    updateLanguageTheme(input.value);
+  });
+});
+
+$("#language-switch-toggle").addEventListener("click", () => {
+  if ($("#language-switch-toggle").disabled) return;
+  const nextLanguage = selectedSettingsLanguage() === "r" ? "python" : "r";
+  setLanguageSelection(nextLanguage);
+});
+
 $("#save-model-defaults").addEventListener("click", async () => {
   setSettingsMessage("Saving defaults...");
   try {
@@ -790,4 +927,4 @@ refresh().catch((error) => {
 
 $("#command-form").classList.add("session-command");
 $(".session-pane").classList.add("python-mode");
-$("#session-title").textContent = "Python session";
+updateRuntimeLabels();

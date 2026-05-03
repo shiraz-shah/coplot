@@ -8,7 +8,7 @@ setup(
     version="0.1.0",
     description="Local web workspace for LLM-assisted data science.",
     packages=["coplot"],
-    package_data={"coplot": ["static/*.html", "static/*.css", "static/*.js"]},
+    package_data={"coplot": ["static/*.html", "static/*.css", "static/*.js", "*.R"]},
     python_requires=">=3.9",
     entry_points={"console_scripts": ["coplot=coplot.server:main"]},
 )

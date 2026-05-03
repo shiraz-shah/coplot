@@ -2,20 +2,19 @@
 
 ## Current Direction
 
-coplot is the Python-first app. Keep it Python-only. Do not follow older plans to
-add first-class R and shell durable files inside this repo.
-
-The R sibling app should be developed separately as `coplotr`, with the same
-product/API/frontend architecture where practical, but with an R runtime,
-`analysis.R`/`coplot.R` decisions made there, and `renv`/`jsonlite` support.
+coplot supports Python and R in one codebase, but each workspace is locked to
+one language at first-run setup. R is currently the default. Do not prompt the
+model to choose between languages during normal use. The startup settings dialog
+owns that choice, then the system prompt is rendered as either Python-only or
+R-only for that workspace.
 
 ## Product Model
 
-coplot is a local web workspace for LLM-assisted Python data science. It gives
+coplot is a local web workspace for LLM-assisted data science. It gives
 the user and agent shared access to:
 
-- a durable Python script
-- a persistent live Python session
+- a durable Python or R script
+- a persistent live Python or R session
 - shell command execution from the workspace root
 - chat
 - plot/image artifacts
@@ -26,6 +25,8 @@ The core boundary is deliberate:
 - live session code is scratch/exploratory state
 - shell is for packages, files, diagnostics, and command-line tools
 - artifacts are explicit files under `coplot/plots/`
+- clear context only flushes model transcript/summary context; it preserves
+  chat, source code, artifacts, and the selected-language session
 
 ## Codebase Shape
 
@@ -59,7 +60,7 @@ coplot.server:main
 New workspaces create/use this visible layout:
 
 ```text
-coplot.py              # durable Python source
+coplot.py or coplot.R  # durable source selected at first-run setup
 coplot/
   config.json          # workspace model/settings config
   chat.jsonl
@@ -67,8 +68,23 @@ coplot/
   artifacts.jsonl
   summary.md
   plots/               # generated PNG plot/image artifacts
-  venv/                # workspace Python environment
+  venv/                # Python workspace environment, Python mode only
+  renv/                # R workspace environment, R mode only
+  renv.lock            # R lockfile, R mode only
 ```
+
+Fresh R workspaces create `coplot.R` with:
+
+```r
+#!/usr/bin/env Rscript
+
+source("coplot/renv/activate.R")
+```
+
+R setup initializes `coplot/renv/`, installs `jsonlite` into that project
+library, snapshots, and records `jsonlite` in `coplot/renv.lock`. The R session
+worker loads global `jsonlite` before activating `renv` so JSON IPC works during
+bootstrap.
 
 Global defaults for new workspaces can be saved from the settings UI at:
 
@@ -84,8 +100,8 @@ workspace shape (`analysis.py`, root `venv/`, root `plots/`, `coplot_data/`).
 Keep the generic action fence names:
 
 ```text
-coplot-edit  -> edits coplot.py
-coplot-run   -> runs Python in the persistent Python session
+coplot-edit  -> edits coplot.py or coplot.R, depending on workspace language
+coplot-run   -> runs code in the persistent selected-language session
 coplot-shell -> runs shell commands from the workspace root
 ```
 
@@ -121,10 +137,16 @@ python -m pip show pandas
 
 Prompt rules to preserve:
 
-- durable edits go to `coplot.py`
-- scratch Python goes through `coplot-run`
+- durable edits go to `coplot.py` in Python mode or `coplot.R` in R mode
+- scratch code goes through `coplot-run`
+- use `coplot-run` freely for exploration, but whenever code creates useful
+  analysis state, also update the durable source with `coplot-edit`
 - shell is for package/system/file checks
 - Python packages should be installed into `coplot/venv/`
+- R packages should be installed with `renv::install(...)`; prefer GitHub
+  remotes for Bioconductor-style packages when possible, avoid `BiocManager`,
+  `devtools`, or `remotes` unless needed, and snapshot with
+  `renv::snapshot(lockfile = "coplot/renv.lock", prompt = FALSE)` after installs
 - plots must be saved as PNGs under `coplot/plots/`
 - do not rely on `plt.show()` for artifacts
 
@@ -146,14 +168,14 @@ The app now exposes backend-visible running jobs in `/api/state`:
 ]
 ```
 
-`PythonSession.execute()` and `ShellSession.execute()` register an active job
-before blocking and clear it in `finally`. The frontend polls `/api/state` while
-chat/session/shell work is pending and renders active jobs as running transcript
-entries.
+`PythonSession.execute()`, `RSession.execute()`, and `ShellSession.execute()`
+register an active job before blocking and clear it in `finally`. The frontend
+polls `/api/state` every 5 seconds while chat/session/shell work is pending and
+renders active jobs as running transcript entries.
 
 This helps long-running agent or user session/shell actions. It does not yet
-make model-call phases or intermediate agent turns fully live; a future shared
-coplot/coplotr improvement should add an `active_agent` state with model turn
+make model-call phases or intermediate agent turns fully live; a future
+improvement should add an `active_agent` state with model turn
 phase/progress.
 
 ## Current Backend Architecture
@@ -169,8 +191,11 @@ Important classes/functions:
 - `ActiveJobStore`: in-memory running session/shell jobs exposed through state.
 - `PythonSession`: starts `session_worker.py` inside `coplot/venv/`, maintains
   persistent Python state, records changed PNGs.
-- `ShellSession`: runs shell commands in workspace root with `coplot/venv/bin`
-  first on `PATH`.
+- `RSession`: starts `r_session_worker.R` with `Rscript --vanilla`, loads
+  `jsonlite`, activates `coplot/renv/`, maintains persistent R state, records
+  changed PNGs.
+- `ShellSession`: runs shell commands in workspace root; Python mode puts
+  `coplot/venv/bin` first on `PATH`.
 - `ContextBuilder`: builds the JSON payload included in the model system prompt.
 - `AgentService`: builds the system prompt, calls the model, parses action
   blocks, runs actions, handles follow-up turns.
@@ -186,16 +211,22 @@ Start in `coplot/static/app.js` and `coplot/static/index.html`.
 Important behavior:
 
 - `render()` refreshes state from `/api/state` but avoids overwriting dirty
-  editor contents.
+  editor contents. It also ignores older source snapshots using
+  `source_mtime_ns`, which prevents stale polling responses from replacing a
+  newer saved file.
 - `postAndRefresh()` handles most write actions and starts polling while work is
   pending.
+- Chat and transcript panes only auto-scroll when already near the bottom, so
+  polling does not reset the user's scroll position.
 - The editor is a textarea plus syntax-highlight mirror.
 - `Cmd/Ctrl+Enter` runs selected code, or the current line when nothing is
   selected, then moves the cursor to the next line.
 - The transcript renders completed entries and backend `active_jobs`.
 - The artifact pane shows the latest plot and opens fullscreen on click.
-- Settings modal handles endpoint connect, model selection, context window,
-  reasoning toggle, save defaults, and workspace apply/proceed.
+- Settings modal handles the prominent R/Python language switch, endpoint
+  connect, model selection, context window, reasoning toggle, save defaults, and
+  workspace apply/proceed.
+- The UI accent is turquoise in R mode and orange-yellow in Python mode.
 
 Replacing the editor with CodeMirror or Monaco remains a good future upgrade.
 
@@ -206,6 +237,7 @@ Basic checks:
 ```bash
 PYTHONPYCACHEPREFIX=/private/tmp/coplot-pycache python3 -m py_compile coplot/server.py coplot/session_worker.py coplot/__main__.py coplot/__init__.py
 node --check coplot/static/app.js
+Rscript --vanilla -e "invisible(parse('coplot/r_session_worker.R')); cat('ok\n')"
 python3 -m coplot --help
 ```
 
@@ -218,10 +250,12 @@ curl -sS http://127.0.0.1:8876/api/state
 
 Manual checks:
 
-- workspace creates `coplot.py` and `coplot/`
+- first-run setup creates `coplot.py` and `coplot/venv/` in Python mode, or
+  `coplot.R`, `coplot/renv/`, and `coplot/renv.lock` in R mode
 - Python session uses `coplot/venv/`
-- shell PATH includes `coplot/venv/bin`
+- R session uses `coplot/renv/`; setup records `jsonlite` in `coplot/renv.lock`
+- shell PATH includes `coplot/venv/bin` in Python mode
 - plots saved in `coplot/plots/` appear in the artifact pane
-- long session/shell runs appear as active transcript jobs
+- long selected-language session/shell runs appear as active transcript jobs
 - stop prevents additional automatic agent follow-up turns without resetting the
-  Python session
+  selected-language session

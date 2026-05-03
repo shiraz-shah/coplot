@@ -16,4 +16,4 @@ coplot = "coplot.server:main"
 packages = ["coplot"]
 
 [tool.setuptools.package-data]
-coplot = ["static/*.html", "static/*.css", "static/*.js"]
+coplot = ["static/*.html", "static/*.css", "static/*.js", "*.R"]

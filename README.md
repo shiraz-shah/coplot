@@ -1,12 +1,14 @@
 # coplot
 
-coplot is a local web workspace for LLM-assisted data science. It gives the user and agent a shared live Python session, shell command execution, chat, and plot artifacts while keeping durable analysis code explicit and reproducible.
+coplot is a local web workspace for LLM-assisted data science. It gives the user and agent a shared live Python or R session, shell command execution, chat, and plot artifacts while keeping durable analysis code explicit and reproducible.
 
 The current MVP is intentionally dependency-light:
 
 - Python standard library HTTP server
 - Vanilla HTML, CSS, and JavaScript frontend
-- A workspace-local `coplot/venv/` for analysis dependencies such as pandas and matplotlib
+- A startup language switch that defaults to R and locks each workspace to Python or R
+- Python workspaces use `coplot.py` and a workspace-local `coplot/venv/`
+- R workspaces use `coplot.R`, `coplot/renv/`, and `coplot/renv.lock`; R mode requires global `renv`/`jsonlite` for bootstrap and records `jsonlite` in the workspace `renv`
 
 ## Install
 
@@ -47,21 +49,23 @@ On another machine on the same LAN, replace `localhost` with the machine's local
 ## Project Shape
 
 - `coplot/server.py` serves the app, persists local state, calls an OpenAI-compatible chat endpoint, and executes agent actions.
-- `coplot/session_worker.py` runs the persistent analysis Python session inside the workspace `coplot/venv/`.
+- `coplot/session_worker.py` runs the persistent Python session inside the workspace `coplot/venv/`.
+- `coplot/r_session_worker.R` runs the persistent R session with `coplot/renv/` activation.
 - `coplot/static/` contains the browser UI.
 - `web-interface-spec.md` captures the product direction.
 - `HANDOFF.md` captures the current implementation state and known rough edges.
 
-PNG files created or modified in `coplot/plots/` by executed Python code are registered or updated as plot artifacts and shown in the artifact pane.
+PNG files created or modified in `coplot/plots/` by executed Python or R code are registered or updated as plot artifacts and shown in the artifact pane.
 
-The session download action exports a zip containing `chat.jsonl`, `coplot.py`, and `coplot/plots/`.
+The session download action exports a zip containing `chat.jsonl`, the durable source file, and `coplot/plots/`.
 
 ## Local State
 
 The app creates local workspace files that are intentionally not committed:
 
-- `coplot.py`
+- `coplot.py` or `coplot.R`
 - `coplot/`
+- `coplot/renv/` and `coplot/renv.lock` for R workspaces
 - generated plot/image files
 
 This keeps GitHub focused on the coplot application source rather than one machine's current analysis session. Each workspace owns its own environment and coplot data.
