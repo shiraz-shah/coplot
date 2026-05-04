@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import argparse
+import binascii
 import io
 import json
 import os
@@ -33,6 +34,36 @@ DEFAULTS_FILE = Path(os.environ.get("COPLOT_DEFAULTS_FILE", Path.home() / ".conf
 EDIT_BLOCK_RE = re.compile(r"```coplot-edit[ \t]*\n(?P<json>.*?)```", re.DOTALL | re.IGNORECASE)
 RUN_BLOCK_RE = re.compile(r"```coplot-run[ \t]*\n(?P<code>.*?)```", re.DOTALL | re.IGNORECASE)
 SHELL_BLOCK_RE = re.compile(r"```coplot-shell[ \t]*\n(?P<command>.*?)```", re.DOTALL | re.IGNORECASE)
+TRANSCRIPT_OUTPUT_LIMIT_BYTES = 8 * 1024
+TRANSCRIPT_OUTPUT_EDGE_BYTES = 4 * 1024
+MAX_CHAT_IMAGE_BYTES = 20 * 1024 * 1024
+TRANSCRIPT_TRUNCATION_MARKER = (
+    "\n\n[Output truncated: showing first 4 KiB and last 4 KiB. "
+    "Run a more specific command to inspect more.]\n\n"
+)
+COMPACTION_PROMPT = """Compact the current coplot session for future model turns.
+
+The current durable code file is will be visible to the future model and is the source of truth.
+
+Write a concise working-memory summary containing only information needed to continue the analysis that is not already obvious from the durable code.
+
+Include:
+- the user's current goal and preferences
+- domain facts discovered in chat
+- data facts discovered in terminal output but not encoded in code
+- decisions made and why
+- unresolved issues, next steps, or user-requested changes
+- important feedback from inspection of plots
+- environment/package/path quirks
+
+Omit:
+- raw terminal logs
+- verbose chat history
+- code already present in the durable file
+- generic descriptions of coplot
+- outdated or superseded attempts
+
+Keep it brief, factual, and useful for the next assistant turn."""
 project: "ProjectState"
 chat_store: "ChatStore"
 transcript_store: "TranscriptStore"
@@ -153,6 +184,7 @@ class ProjectState:
     artifacts_file: Path
     model_settings_file: Path
     plots_dir: Path
+    chat_images_dir: Path
     language: str = "python"
 
     @classmethod
@@ -168,6 +200,7 @@ class ProjectState:
             artifacts_file=agent_data_dir / "artifacts.jsonl",
             model_settings_file=agent_data_dir / "config.json",
             plots_dir=agent_data_dir / "plots",
+            chat_images_dir=agent_data_dir / "chat_images",
         )
 
     @property
@@ -204,6 +237,7 @@ class ProjectState:
             artifacts_file=self.artifacts_file,
             model_settings_file=self.model_settings_file,
             plots_dir=self.plots_dir,
+            chat_images_dir=self.chat_images_dir,
             language=normalize_language(language),
         )
 
@@ -211,6 +245,7 @@ class ProjectState:
         self.root.mkdir(parents=True, exist_ok=True)
         self.agent_data_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
+        self.chat_images_dir.mkdir(parents=True, exist_ok=True)
         if not self.summary_file.exists():
             self.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
         self.chat_file.touch(exist_ok=True)
@@ -291,10 +326,10 @@ def normalize_language(value: Any) -> str:
 def default_model_settings() -> dict[str, Any]:
     return {
         "endpoint_url": "http://localhost:11434",
-        "model": "qwen3.5:2b",
+        "model": "qwen3.6",
         "language": "r",
         "workspace_setup_complete": False,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
         "temperature": 0.2,
         "reasoning_enabled": False,
         "reasoning_control": "auto",
@@ -479,6 +514,54 @@ def estimate_tokens(value: Any) -> int:
     return max(1, int(len(text) / 4))
 
 
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def truncate_middle_utf8(text: str, head_bytes: int, tail_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= head_bytes + tail_bytes:
+        return text
+    head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
+    return f"{head}{TRANSCRIPT_TRUNCATION_MARKER}{tail}"
+
+
+def truncate_transcript_output(stdout: str, stderr: str) -> tuple[str, str]:
+    stdout = str(stdout)
+    stderr = str(stderr)
+    if utf8_len(stdout) + utf8_len(stderr) <= TRANSCRIPT_OUTPUT_LIMIT_BYTES:
+        return stdout, stderr
+
+    if stdout and stderr:
+        combined = f"{stdout}\n{stderr}"
+        return truncate_middle_utf8(
+            combined,
+            TRANSCRIPT_OUTPUT_EDGE_BYTES,
+            TRANSCRIPT_OUTPUT_EDGE_BYTES,
+        ), ""
+    if stderr:
+        return "", truncate_middle_utf8(
+            stderr,
+            TRANSCRIPT_OUTPUT_EDGE_BYTES,
+            TRANSCRIPT_OUTPUT_EDGE_BYTES,
+        )
+    return truncate_middle_utf8(
+        stdout,
+        TRANSCRIPT_OUTPUT_EDGE_BYTES,
+        TRANSCRIPT_OUTPUT_EDGE_BYTES,
+    ), ""
+
+
+def truncate_transcript_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    copied = dict(entry)
+    copied["stdout"], copied["stderr"] = truncate_transcript_output(
+        str(copied.get("stdout", "")),
+        str(copied.get("stderr", "")),
+    )
+    return copied
+
+
 def context_token_breakdown(payload: dict[str, Any]) -> dict[str, int]:
     return {
         "durable_code": estimate_tokens(payload.get("durable_code", "")),
@@ -494,7 +577,14 @@ class ChatStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def append(self, role: str, content: str) -> dict[str, Any]:
+    def replace(self, entries: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
+            encoding="utf-8",
+        )
+
+    def append(self, role: str, content: str, attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         return append_jsonl(
             self.path,
             {
@@ -502,6 +592,7 @@ class ChatStore:
                 "created_at": utc_now_iso(),
                 "role": role,
                 "content": str(content),
+                "attachments": attachments or [],
             },
         )
 
@@ -525,6 +616,7 @@ class TranscriptStore:
         duration_ms: int,
         artifacts: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        stdout, stderr = truncate_transcript_output(stdout, stderr)
         return append_jsonl(
             self.path,
             {
@@ -555,6 +647,7 @@ class TranscriptStore:
         duration_ms: int,
         cwd: Path,
     ) -> dict[str, Any]:
+        stdout, stderr = truncate_transcript_output(stdout, stderr)
         return append_jsonl(
             self.path,
             {
@@ -573,7 +666,7 @@ class TranscriptStore:
         )
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
-        return read_jsonl(self.path, limit)
+        return [truncate_transcript_entry(entry) for entry in read_jsonl(self.path, limit)]
 
 
 class ArtifactStore:
@@ -1087,12 +1180,13 @@ class AgentService:
         self.shell = shell
         self.settings = settings
 
-    def respond(self, message: str) -> dict[str, Any]:
+    def respond(self, message: str, images: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         global stop_requested
         stop_requested = False
-        self.chat.append("user", message)
+        attachments = self._save_chat_images(images or [])
+        self.chat.append("user", message, attachments=attachments)
         actions: list[dict[str, Any]] = []
-        assistant = self._request_and_apply(message, action_feedback="")
+        assistant = self._request_and_apply(message, action_feedback="", attachments=attachments)
         pending_actions = assistant["actions"]
         actions.extend(pending_actions)
         followup_count = 0
@@ -1109,7 +1203,85 @@ class AgentService:
             self.chat.append("system", "Agent stopped by user.")
         return {"message": assistant["message"], "actions": actions, "stopped": stop_requested}
 
-    def _request_and_apply(self, message: str, *, action_feedback: str) -> dict[str, Any]:
+    def compact_context(self) -> dict[str, Any]:
+        settings = self.settings.read()
+        model = str(settings["model"]).strip()
+        if not model:
+            raise RuntimeError("Model name is empty. Open chat settings and choose a model.")
+
+        context = self.context_builder.payload("Compact context")
+        prompt = f"{COMPACTION_PROMPT}\n\nContext payload:\n{json.dumps(context, ensure_ascii=False)}"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "Create the compacted working-memory summary now."},
+            ],
+            "max_tokens": int(settings["max_tokens"]),
+            "temperature": float(settings["temperature"]),
+            "stream": False,
+        }
+        self._apply_reasoning_settings(payload, settings)
+        request = urllib.request.Request(
+            self.settings.request_url(),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=int(settings["timeout_seconds"])) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = self._extract_chat_text(data)
+        except (urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Context compaction failed: {exc}") from exc
+
+        summary = content.strip()
+        self.project.summary_file.write_text(summary + "\n", encoding="utf-8")
+        self.project.transcript_file.write_text("", encoding="utf-8")
+        system_message = {
+            "id": str(uuid4()),
+            "created_at": utc_now_iso(),
+            "role": "system",
+            "content": f"Context compacted.\n\n{summary}",
+        }
+        self.chat.replace([system_message])
+        return {"message": system_message, "summary": summary}
+
+    def _save_chat_images(self, images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        attachments: list[dict[str, Any]] = []
+        for image in images:
+            mime_type = str(image.get("mime_type") or image.get("type") or "").strip().lower()
+            data_url = str(image.get("data_url") or "")
+            if mime_type != "image/png" or not data_url.startswith("data:image/png;base64,"):
+                raise ValueError("Only pasted PNG images are supported.")
+            try:
+                raw = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+            except (binascii.Error, IndexError) as exc:
+                raise ValueError("Pasted PNG image data is invalid.") from exc
+            if len(raw) > MAX_CHAT_IMAGE_BYTES:
+                raise ValueError("Pasted PNG image is too large.")
+            image_id = str(uuid4())
+            filename = f"{image_id}.png"
+            path = self.project.chat_images_dir / filename
+            path.write_bytes(raw)
+            attachments.append(
+                {
+                    "id": image_id,
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "path": str(path.resolve().relative_to(self.project.root.resolve())),
+                    "size_bytes": len(raw),
+                }
+            )
+        return attachments
+
+    def _request_and_apply(
+        self,
+        message: str,
+        *,
+        action_feedback: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         settings = self.settings.read()
         model = str(settings["model"]).strip()
         if not model:
@@ -1121,7 +1293,7 @@ class AgentService:
         if action_feedback:
             context["action_feedback"] = action_feedback
         prompt = self._system_prompt(context)
-        user_content = self._user_content(message)
+        user_content = self._user_content(message, attachments=attachments or [])
         payload = {
             "model": model,
             "messages": [
@@ -1236,7 +1408,7 @@ class AgentService:
             if action.get("type") not in {"execute_session", "execute_shell"}:
                 continue
             result = action.get("result", {})
-            entry = result.get("entry", result)
+            entry = truncate_transcript_entry(result.get("entry", result))
             chunks.append(
                 json.dumps(
                     {
@@ -1263,16 +1435,36 @@ class AgentService:
         if control == "chat_template_kwargs":
             payload["chat_template_kwargs"] = {"enable_thinking": reasoning_enabled}
 
-    def _user_content(self, message: str) -> str | list[dict[str, Any]]:
+    def _user_content(self, message: str, *, attachments: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+        if attachments:
+            parts: list[dict[str, Any]] = [{"type": "text", "text": message or "Please inspect the attached image."}]
+            for attachment in attachments:
+                data_url = self._chat_attachment_data_url(attachment)
+                if data_url:
+                    parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            return parts if len(parts) > 1 else message
+
         artifacts = self._image_artifacts_for_message(message)
         if not artifacts:
             return message
-        parts: list[dict[str, Any]] = [{"type": "text", "text": message}]
+        parts = [{"type": "text", "text": message}]
         for artifact in artifacts:
             data_url = self._artifact_data_url(artifact)
             if data_url:
                 parts.append({"type": "image_url", "image_url": {"url": data_url}})
         return parts if len(parts) > 1 else message
+
+    def _chat_attachment_data_url(self, attachment: dict[str, Any]) -> str | None:
+        if attachment.get("mime_type") != "image/png":
+            return None
+        path_value = str(attachment.get("path", ""))
+        if not path_value:
+            return None
+        path = (self.project.root / path_value).resolve()
+        if not path.is_file() or not path.is_relative_to(self.project.chat_images_dir.resolve()):
+            return None
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
 
     def _image_artifacts_for_message(self, message: str) -> list[dict[str, Any]]:
         lowered = message.lower()
@@ -1469,6 +1661,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/run-shell": self.run_shell,
             "/api/chat": self.chat,
             "/api/stop": self.stop_agent,
+            "/api/compact-context": self.compact_context,
             "/api/clear-context": self.clear_context,
             "/api/model-settings": self.save_model_settings,
             "/api/model-settings-defaults": self.save_model_settings_defaults,
@@ -1522,6 +1715,11 @@ class Handler(SimpleHTTPRequestHandler):
             if project.plots_dir.exists():
                 archive.writestr("coplot/plots/", "")
                 for path in sorted(project.plots_dir.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.resolve().relative_to(project.root.resolve()))
+            if project.chat_images_dir.exists():
+                archive.writestr("coplot/chat_images/", "")
+                for path in sorted(project.chat_images_dir.rglob("*")):
                     if path.is_file():
                         archive.write(path, path.resolve().relative_to(project.root.resolve()))
         data = buffer.getvalue()
@@ -1590,19 +1788,31 @@ class Handler(SimpleHTTPRequestHandler):
         project.source_file.write_text("", encoding="utf-8")
         project.chat_file.write_text("", encoding="utf-8")
         project.transcript_file.write_text("", encoding="utf-8")
+        project.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
         artifact_store.clear()
         self.clear_artifact_files()
+        self.clear_chat_image_files()
         project.recreate_runtime()
         self.send_json({"result": {"ok": True, "message": "Workspace cleared."}, "state": self.state()})
 
     def clear_context(self, body: dict[str, Any]) -> None:
-        project.transcript_file.write_text("", encoding="utf-8")
-        project.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
-        self.send_json({"result": {"ok": True, "message": "Transcript context cleared."}, "state": self.state()})
+        self.compact_context(body)
+
+    def compact_context(self, body: dict[str, Any]) -> None:
+        result = agent_service.compact_context()
+        self.send_json({"result": result, "state": self.state()})
 
     def clear_artifact_files(self) -> None:
         root = project.plots_dir.resolve()
         for path in project.plots_dir.rglob("*"):
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root) or not path.is_file():
+                continue
+            path.unlink()
+
+    def clear_chat_image_files(self) -> None:
+        root = project.chat_images_dir.resolve()
+        for path in project.chat_images_dir.rglob("*"):
             resolved = path.resolve()
             if not resolved.is_relative_to(root) or not path.is_file():
                 continue
@@ -1614,7 +1824,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"result": result, "state": self.state()})
 
     def chat(self, body: dict[str, Any]) -> None:
-        result = agent_service.respond(str(body.get("message", "")))
+        images = body.get("images", [])
+        if not isinstance(images, list):
+            images = []
+        result = agent_service.respond(str(body.get("message", "")), images=images)
         self.send_json({"result": result, "state": self.state()})
 
     def stop_agent(self, body: dict[str, Any]) -> None:

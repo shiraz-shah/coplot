@@ -4,6 +4,8 @@ const state = {
   pendingEditorSelection: null,
   chatPending: false,
   pendingChatMessage: "",
+  chatImages: [],
+  pendingChatImages: [],
   terminalPending: null,
   fullscreenArtifactIndex: null,
   settingsDialogShown: false,
@@ -27,6 +29,7 @@ function setStatus(text) {
 function syncPendingControls() {
   $("#chat-input").disabled = state.chatPending;
   $("#command-input").disabled = Boolean(state.terminalPending);
+  $("#compact-context").disabled = state.chatPending || Boolean(state.terminalPending);
   $("#stop-agent").hidden = !(state.chatPending || state.terminalPending);
 }
 
@@ -63,6 +66,7 @@ function render(options = {}) {
     if (options.forceSource) state.editorDirty = false;
   }
   renderChat(data.chat);
+  renderChatAttachments();
   renderTranscript(data.transcript, data.active_jobs || []);
   renderArtifacts(data.artifacts);
   renderModelSettings(data.model_settings);
@@ -105,8 +109,10 @@ function renderChat(entries) {
     const item = document.createElement("div");
     item.className = `message ${entry.role}`;
     item.dataset.time = formatTime(entry.created_at);
+    const attachmentsHtml = renderAttachmentChips(entry.attachments || []);
     item.innerHTML = `
       <div class="label">${escapeHtml(entry.role)}</div>
+      ${attachmentsHtml}
       <div class="content">${formatMarkdownLite(entry.content)}</div>
     `;
     log.appendChild(item);
@@ -133,10 +139,12 @@ function restoreScrollPosition(element, shouldStickToBottom, previousScrollTop) 
 }
 
 function shouldRenderPendingUserMessage(entries) {
-  if (!state.pendingChatMessage) return false;
+  if (!state.pendingChatMessage && !state.pendingChatImages.length) return false;
   const newEntries = entries.slice(state.pendingChatBaselineLength);
   const serverHasPendingMessage = newEntries.some(
-    (entry) => entry.role === "user" && entry.content === state.pendingChatMessage
+    (entry) => entry.role === "user" &&
+      entry.content === state.pendingChatMessage &&
+      (entry.attachments || []).length === state.pendingChatImages.length
   );
   return !serverHasPendingMessage;
 }
@@ -146,9 +154,61 @@ function renderPendingUserMessage(content) {
   item.className = "message user pending-user-message";
   item.innerHTML = `
     <div class="label">user</div>
+    ${renderAttachmentChips(state.pendingChatImages)}
     <div class="content">${formatMarkdownLite(content)}</div>
   `;
   return item;
+}
+
+function renderAttachmentChips(attachments) {
+  const imageAttachments = (attachments || []).filter((attachment) => attachment.type === "image");
+  if (!imageAttachments.length) return "";
+  return `
+    <div class="message-attachments">
+      ${imageAttachments.map((attachment) => `
+        <span class="attachment-chip" title="${escapeHtml(formatAttachmentTitle(attachment))}">
+          <span aria-hidden="true">▧</span>
+          <span>PNG</span>
+          <span>${escapeHtml(formatBytes(attachment.size_bytes || 0))}</span>
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderChatAttachments() {
+  const tray = $("#chat-attachments");
+  if (!state.chatImages.length) {
+    tray.hidden = true;
+    tray.innerHTML = "";
+    return;
+  }
+  tray.hidden = false;
+  tray.innerHTML = state.chatImages.map((image, index) => `
+    <span class="attachment-chip composer-attachment" title="${escapeHtml(image.name || "Pasted PNG")}">
+      <span aria-hidden="true">▧</span>
+      <span>PNG</span>
+      <span>${escapeHtml(formatBytes(image.size_bytes))}</span>
+      <button type="button" data-remove-image="${index}" title="Remove image" aria-label="Remove image">×</button>
+    </span>
+  `).join("");
+  tray.querySelectorAll("[data-remove-image]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.chatImages.splice(Number(button.dataset.removeImage), 1);
+      renderChatAttachments();
+      $("#chat-input").focus();
+    });
+  });
+}
+
+function formatAttachmentTitle(attachment) {
+  return `${attachment.mime_type || "image/png"} · ${formatBytes(attachment.size_bytes || 0)}`;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  return `${Math.round(value / 102.4) / 10} KB`;
 }
 
 function renderTypingMessage() {
@@ -262,9 +322,9 @@ function sortedPlotArtifacts(artifacts) {
 
 function renderModelSettings(settings) {
   $("#setting-endpoint-url").value = settings.endpoint_url || "http://localhost:11434";
-  populateModelOptions(settings.model || "qwen3.5:2b");
+  populateModelOptions(settings.model || "qwen3.6");
   setLanguageSelection(settings.language || state.data?.project?.language || "r");
-  $("#setting-max-tokens").value = settings.max_tokens || 8192;
+  $("#setting-max-tokens").value = settings.max_tokens || 16384;
   $("#setting-context-window").value = settings.context_window_tokens || 32768;
   $("#setting-temperature").value = settings.temperature ?? 0.2;
   $("#setting-timeout").value = settings.timeout_seconds || 600;
@@ -289,7 +349,7 @@ function readModelSettingsForm() {
 function populateModelOptions(selectedModel, models = null) {
   const select = $("#setting-model");
   if (models) state.endpointModels = models;
-  const selected = selectedModel || select.value || "qwen3.5:2b";
+  const selected = selectedModel || select.value || "qwen3.6";
   const ids = models && models.length ? models.map((model) => model.id).filter(Boolean) : [selected];
   if (!ids.includes(selected)) ids.unshift(selected);
   select.innerHTML = "";
@@ -471,6 +531,7 @@ async function postAndRefresh(path, body, options = {}) {
   state.pendingChatBaselineLength = state.data?.chat?.length || 0;
   state.chatPending = Boolean(options.chatPending);
   state.pendingChatMessage = options.pendingChatMessage || "";
+  state.pendingChatImages = options.pendingChatImages || [];
   state.terminalPending = options.terminalPending || null;
   renderPendingState();
   startPendingPoll();
@@ -486,6 +547,7 @@ async function postAndRefresh(path, body, options = {}) {
     }
     state.chatPending = false;
     state.pendingChatMessage = "";
+    state.pendingChatImages = [];
     state.pendingChatBaselineLength = 0;
     state.terminalPending = null;
     stopPendingPoll();
@@ -495,6 +557,7 @@ async function postAndRefresh(path, body, options = {}) {
   } catch (error) {
     state.chatPending = false;
     state.pendingChatMessage = "";
+    state.pendingChatImages = [];
     state.pendingChatBaselineLength = 0;
     state.terminalPending = null;
     stopPendingPoll();
@@ -776,9 +839,16 @@ $("#command-input").addEventListener("keydown", (event) => {
 $("#chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("#chat-input").value.trim();
-  if (!input) return;
+  if (!input && !state.chatImages.length) return;
+  const images = state.chatImages.slice();
   $("#chat-input").value = "";
-  await postAndRefresh("/api/chat", { message: input }, { chatPending: true, pendingChatMessage: input });
+  state.chatImages = [];
+  renderChatAttachments();
+  await postAndRefresh(
+    "/api/chat",
+    { message: input, images },
+    { chatPending: true, pendingChatMessage: input, pendingChatImages: images }
+  );
 });
 
 $("#source-editor").addEventListener("input", updateSourceHighlight);
@@ -803,6 +873,35 @@ $("#chat-input").addEventListener("keydown", (event) => {
     $("#chat-form").requestSubmit();
   }
 });
+
+$("#chat-input").addEventListener("paste", async (event) => {
+  const items = Array.from(event.clipboardData?.items || []);
+  const imageItems = items.filter((item) => item.kind === "file" && item.type === "image/png");
+  if (!imageItems.length) return;
+  event.preventDefault();
+  for (const item of imageItems) {
+    const file = item.getAsFile();
+    if (!file) continue;
+    const dataUrl = await readFileAsDataUrl(file);
+    state.chatImages.push({
+      type: "image",
+      mime_type: "image/png",
+      name: file.name || "pasted-image.png",
+      size_bytes: file.size,
+      data_url: dataUrl,
+    });
+  }
+  renderChatAttachments();
+});
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result || "")));
+    reader.addEventListener("error", () => reject(reader.error || new Error("Failed to read pasted image.")));
+    reader.readAsDataURL(file);
+  });
+}
 
 document.addEventListener("keydown", async (event) => {
   if ($("#artifact-fullscreen").open && event.key === "ArrowLeft") {
@@ -901,8 +1000,8 @@ $("#model-settings-form").addEventListener("submit", async (event) => {
   state.settingsFirstRun = false;
 });
 
-$("#clear-context").addEventListener("click", async () => {
-  await postAndRefresh("/api/clear-context", {});
+$("#compact-context").addEventListener("click", async () => {
+  await postAndRefresh("/api/compact-context", {}, { chatPending: true });
 });
 
 $("#stop-agent").addEventListener("click", async () => {

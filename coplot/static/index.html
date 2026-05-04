@@ -44,11 +44,12 @@
           </div>
           <div class="actions">
             <button id="open-model-settings" type="button" title="Settings" aria-label="Settings">⚙</button>
-            <button id="clear-context" type="button" title="Clear transcript context" aria-label="Clear transcript context">◧</button>
+            <button id="compact-context" type="button" title="Compact context" aria-label="Compact context">◧</button>
           </div>
         </div>
         <div id="chat-log" class="scroll"></div>
         <form id="chat-form" class="composer">
+          <div id="chat-attachments" class="chat-attachments" hidden></div>
           <textarea id="chat-input" rows="1" placeholder="Ask about the code, session, outputs, or latest plot"></textarea>
           <button id="stop-agent" type="button" title="Stop after the current action" aria-label="Stop after the current action" hidden>■</button>
         </form>

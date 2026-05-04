@@ -159,6 +159,55 @@ textarea:focus {
   border-top: 1px solid var(--line);
 }
 
+.chat-attachments {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.message.assistant .message-attachments,
+.message.system .message-attachments {
+  justify-content: flex-start;
+}
+
+.attachment-chip {
+  align-items: center;
+  background: rgb(255 255 255 / 0.08);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 5px;
+  line-height: 1;
+  padding: 5px 7px;
+  white-space: nowrap;
+}
+
+.attachment-chip button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  padding: 0 0 0 2px;
+}
+
+.attachment-chip button:hover {
+  color: var(--text);
+}
+
 .message,
 .entry {
   border: 1px solid var(--line);

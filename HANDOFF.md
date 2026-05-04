@@ -25,8 +25,13 @@ The core boundary is deliberate:
 - live session code is scratch/exploratory state
 - shell is for packages, files, diagnostics, and command-line tools
 - artifacts are explicit files under `coplot/plots/`
-- clear context only flushes model transcript/summary context; it preserves
-  chat, source code, artifacts, and the selected-language session
+- context compaction writes a concise working-memory summary to
+  `coplot/summary.md`, replaces chat history with a system message containing
+  that summary, and clears transcript history; it preserves source code,
+  artifacts, and the selected-language session
+- terminal/session stdout and stderr are middle-truncated per transcript entry
+  before storage, UI rendering, context payloads, and action follow-up feedback;
+  oversized output keeps the first 4 KiB and last 4 KiB with a marker between
 
 ## Codebase Shape
 
@@ -68,6 +73,7 @@ coplot/
   artifacts.jsonl
   summary.md
   plots/               # generated PNG plot/image artifacts
+  chat_images/         # pasted PNGs attached to chat turns
   venv/                # Python workspace environment, Python mode only
   renv/                # R workspace environment, R mode only
   renv.lock            # R lockfile, R mode only
@@ -198,7 +204,9 @@ Important classes/functions:
   `coplot/venv/bin` first on `PATH`.
 - `ContextBuilder`: builds the JSON payload included in the model system prompt.
 - `AgentService`: builds the system prompt, calls the model, parses action
-  blocks, runs actions, handles follow-up turns.
+  blocks, runs actions, handles follow-up turns. Pasted PNGs are stored under
+  `coplot/chat_images/`; only metadata stays in `chat.jsonl`, while the image is
+  attached to the model request for that user turn.
 - `Handler`: HTTP API and static/artifact serving.
 
 Artifact URLs support both current paths (`/coplot/plots/...`) and legacy
@@ -229,6 +237,20 @@ Important behavior:
 - The UI accent is turquoise in R mode and orange-yellow in Python mode.
 
 Replacing the editor with CodeMirror or Monaco remains a good future upgrade.
+
+## Unreproduced Issues
+
+- Possible action rendering/execution mismatch: user observed chat messages
+  rendering action notes such as "Ran session scratch code" or "Applied editor
+  update", but the expected terminal/editor effect did not appear and the model
+  repeated similar intent statements. This is not currently reproducible. The
+  frontend action notes are only display replacements for text that looks like
+  `coplot-run`, `coplot-shell`, or `coplot-edit` fences; they do not prove the
+  backend parsed or executed the action. If it happens again, compare
+  `coplot/chat.jsonl` raw assistant content, `coplot/transcript.jsonl`, source
+  file changes, and any `Failed to apply coplot-edit block` system messages.
+  If chat has a valid backend action fence but transcript/source did not change,
+  inspect the backend parser/execution path next.
 
 ## Validation Checklist
 

@@ -7,6 +7,7 @@ coplot/venv/
 coplot/renv/
 coplot/renv.lock
 coplot/plots/
+coplot/chat_images/
 coplot/*.jsonl
 coplot/summary.md
 coplot/config.json
@@ -25,6 +26,7 @@ reference/
 
 # Generated analysis outputs
 *.png
+!docs/assets/*.png
 *.jpg
 *.jpeg
 *.svg
