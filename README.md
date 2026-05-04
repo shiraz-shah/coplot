@@ -1,8 +1,8 @@
 # coplot
 
-`coplot` is a **local first** AI workspace for data scientists who work in Python or R and need to keep sensitive data on their own machine. No API keys. No cloud models. `coplot` plugs into `vLLM` and `ollama` instead.
+Coplot is a **local first** AI workspace for data scientists that need to keep sensitive data on their own machine. No API keys. No cloud models. Coplot plugs into vLLM and Ollama instead.
 
-Open source multimodal models Like Gemma 4 and Qwen 3.6 are now strong enough for real analytical work and tool use. The missing piece is the interface. Coding-agents like OpenCode or OpenClaw are a poor fit because they work with files and URLs, not **data frames** and **plots**.
+Open source multimodal models Like Gemma 4 and Qwen 3.6 are strong enough for real analytical work and tool use. The missing piece is the interface. Coding-agents like OpenCode or OpenClaw are a poor fit because they work with files and URLs, not **data frames** and **plots**.
 
 `coplot` fills that gap. It gives you a familiar notebook/RStudio-like workspace with a chat beside your code, live Python or R execution, and the LLM **sees your plots** live. Just give it an Ollama or vLLM endpoint URL and you can start data wrangling.
 ## Live Sessions
@@ -14,14 +14,6 @@ Open source multimodal models Like Gemma 4 and Qwen 3.6 are now strong enough fo
 ### R
 
 ![coplot R session](docs/assets/coplot-r-session.png)
-
-The current app is intentionally dependency-light:
-
-- Python standard library HTTP server
-- Vanilla HTML, CSS, and JavaScript frontend
-- A startup language switch that defaults to R and locks each workspace to Python or R
-- Python workspaces use `coplot.py` and a workspace-local `coplot/venv/`
-- R workspaces use `coplot.R`, `coplot/renv/`, and `coplot/renv.lock`; R mode requires global `renv`/`jsonlite` for bootstrap and records `jsonlite` in the workspace `renv`
 
 ## Install
 
@@ -90,6 +82,12 @@ The app creates local workspace files in your project folder. Dependencies are p
 - Once you're happy with `coplot`'s result, copy the code to Rstudio or Jupyter and continue there
 
 ## Project Shape
+The current app is intentionally dependency-light:
+- Python standard library HTTP server
+- Vanilla HTML, CSS, and JavaScript frontend
+- A startup language switch that defaults to R and locks each workspace to Python or R
+- Python workspaces use `coplot.py` and a workspace-local `coplot/venv/`
+- R workspaces use `coplot.R`, `coplot/renv/`. R mode packages `jsonlite` and `renv` installed
 - `coplot/server.py` serves the app, persists local state, calls an OpenAI-compatible chat endpoint, and executes agent actions.
 - `coplot/session_worker.py` runs the persistent Python session inside the workspace `coplot/venv/`.
 - `coplot/r_session_worker.R` runs the persistent R session with `coplot/renv/` activation.
