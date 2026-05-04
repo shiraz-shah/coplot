@@ -26,7 +26,7 @@ python3 -m pip install -e .
 From GitHub as an app:
 
 ```bash
-pipx install git+https://github.com/yourname/coplot.git
+pipx install git+https://github.com/shiraz-shah/coplot.git
 ```
 
 ## Run
@@ -70,7 +70,7 @@ The app creates local workspace files in your project folder. Dependencies are p
 - `coplot/plots/` - plots that the model can see
 - `coplot/chat_images/` - pasted PNGs attached to chat turns
 
-# Working with `coplot`
+## Working with `coplot`
 - The LLM sees your code, Python/R and Shell output and your last plot
 - The LLM often prefers one-off code execution in the terminal instead of editing and running
 - Ask it to "remember to update the code" to make it add reproducible to `coplot.R or py`
