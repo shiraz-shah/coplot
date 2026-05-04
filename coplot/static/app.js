@@ -12,7 +12,7 @@ const state = {
   settingsFirstRun: false,
   editorDirty: false,
   lastServerSource: "",
-  lastSourceMtimeNs: 0,
+  lastSourceMtimeNs: "0",
   endpointModels: [],
   pendingPollTimer: null,
   pendingChatBaselineLength: 0,
@@ -40,7 +40,10 @@ async function api(path, options = {}) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.error || response.statusText);
+    const error = new Error(payload.error || response.statusText);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
@@ -57,8 +60,8 @@ function render(options = {}) {
   $("#source-name").textContent = data.project.source_file;
   updateRuntimeLabels();
   renderContextMeter(data.context_usage);
-  const sourceMtimeNs = Number(data.source_mtime_ns || 0);
-  const staleSource = sourceMtimeNs > 0 && sourceMtimeNs < state.lastSourceMtimeNs;
+  const sourceMtimeNs = String(data.source_mtime_ns || "0");
+  const staleSource = compareSourceMtime(sourceMtimeNs, state.lastSourceMtimeNs) < 0;
   if (!staleSource && (options.forceSource || (!state.editorDirty && document.activeElement !== $("#source-editor")))) {
     setEditorValue(data.source);
     state.lastServerSource = data.source;
@@ -93,6 +96,14 @@ function renderContextMeter(usage) {
     `transcript: ~${Math.round((breakdown.recent_transcript || 0) / 100) / 10}k`,
     `artifacts: ~${Math.round((breakdown.artifacts || 0) / 100) / 10}k`,
   ].join("\n");
+}
+
+function compareSourceMtime(left, right) {
+  const leftValue = BigInt(String(left || "0"));
+  const rightValue = BigInt(String(right || "0"));
+  if (leftValue < rightValue) return -1;
+  if (leftValue > rightValue) return 1;
+  return 0;
 }
 
 function renderChat(entries) {
@@ -543,7 +554,10 @@ async function postAndRefresh(path, body, options = {}) {
     if (options.savedSource !== undefined) {
       state.editorDirty = false;
       state.lastServerSource = options.savedSource;
-      state.lastSourceMtimeNs = Number(state.data?.source_mtime_ns || state.lastSourceMtimeNs || 0);
+      state.lastSourceMtimeNs = String(state.data?.source_mtime_ns || state.lastSourceMtimeNs || "0");
+      if (state.data) {
+        state.data = { ...state.data, source: options.savedSource };
+      }
     }
     state.chatPending = false;
     state.pendingChatMessage = "";
@@ -552,9 +566,23 @@ async function postAndRefresh(path, body, options = {}) {
     state.terminalPending = null;
     stopPendingPoll();
     syncPendingControls();
-    render({ forceSource: Boolean(state.pendingEditorSelection) });
+    render({ forceSource: options.savedSource !== undefined || Boolean(state.pendingEditorSelection) });
     return payload;
   } catch (error) {
+    if (error.status === 409 && error.payload?.state) {
+      state.data = error.payload.state;
+      state.editorDirty = false;
+      state.pendingChatMessage = "";
+      state.pendingChatImages = [];
+      state.pendingChatBaselineLength = 0;
+      state.terminalPending = null;
+      state.chatPending = false;
+      stopPendingPoll();
+      syncPendingControls();
+      render({ forceSource: true });
+      setStatus(error.message);
+      return error.payload;
+    }
     state.chatPending = false;
     state.pendingChatMessage = "";
     state.pendingChatImages = [];
@@ -768,7 +796,11 @@ function openArtifactFullscreen(index) {
 
 $("#save-source").addEventListener("click", async () => {
   const source = $("#source-editor").value;
-  await postAndRefresh("/api/save", { source }, { savedSource: source });
+  await postAndRefresh(
+    "/api/save",
+    { source, source_mtime_ns: state.lastSourceMtimeNs },
+    { savedSource: source }
+  );
 });
 
 $("#run-selected").addEventListener("click", async () => {
@@ -779,7 +811,7 @@ $("#run-file").addEventListener("click", async () => {
   const source = $("#source-editor").value;
   await postAndRefresh(
     "/api/run-file",
-    { source },
+    { source, source_mtime_ns: state.lastSourceMtimeNs },
     { terminalPending: { kind: "session", source: "durable_script", input: source }, savedSource: source },
   );
 });

@@ -222,6 +222,11 @@ Important behavior:
   editor contents. It also ignores older source snapshots using
   `source_mtime_ns`, which prevents stale polling responses from replacing a
   newer saved file.
+- Manual save and run-file writes send the editor's last-seen
+  `source_mtime_ns` as a string token; the backend rejects stale writes with
+  HTTP 409 instead of overwriting newer agent/server edits. Keep this token out
+  of JavaScript `Number`, because nanosecond mtimes exceed the safe integer
+  range.
 - `postAndRefresh()` handles most write actions and starts polling while work is
   pending.
 - Chat and transcript panes only auto-scroll when already near the bottom, so
@@ -251,6 +256,15 @@ Replacing the editor with CodeMirror or Monaco remains a good future upgrade.
   file changes, and any `Failed to apply coplot-edit block` system messages.
   If chat has a valid backend action fence but transcript/source did not change,
   inspect the backend parser/execution path next.
+- Source/editor synchronization remains a place to be careful. Recent fixes add
+  stale-save rejection and post-save editor preservation, but if disappearing or
+  reverting editor changes recur, avoid more local patches at first. Instead,
+  formalize the source sync contract as a small state machine: server source has
+  a version token, browser editor has a base version token, local dirty edits are
+  preserved, agent edits replace the editor only when no unsaved local edits
+  exist, saves require matching base/server versions, and conflict handling must
+  not discard local text. Then audit `render()`, polling, save, run-file, and
+  agent edit flows against that contract.
 
 ## Validation Checklist
 
@@ -281,3 +295,6 @@ Manual checks:
 - long selected-language session/shell runs appear as active transcript jobs
 - stop prevents additional automatic agent follow-up turns without resetting the
   selected-language session
+- edit-only agent actions trigger automatic follow-up and action feedback, so
+  the model gets an explicit "edit applied" signal before continuing; this helps
+  avoid repeated stale positional edits after the user says "proceed"

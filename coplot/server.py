@@ -104,6 +104,22 @@ def file_mtime_ns(path: Path) -> int:
         return 0
 
 
+def assert_source_not_stale(expected_mtime_ns: Any) -> None:
+    if expected_mtime_ns is None:
+        return
+    expected = int(expected_mtime_ns)
+    current = file_mtime_ns(project.source_file)
+    if expected > 0 and current > 0 and current != expected:
+        raise SourceConflictError(
+            "Source changed on disk after this editor snapshot was loaded. "
+            "Refresh before saving to avoid overwriting newer edits."
+        )
+
+
+class SourceConflictError(RuntimeError):
+    pass
+
+
 def apply_line_edits(source: str, edits: list[dict[str, Any]]) -> str:
     if not edits:
         return source
@@ -1400,11 +1416,28 @@ class AgentService:
         if not actions:
             return False
         recent = actions[-6:]
-        return any(action.get("type") in {"execute_session", "execute_shell"} for action in recent)
+        return any(action.get("type") in {"edit_file", "execute_session", "execute_shell"} for action in recent)
 
     def _action_feedback(self, actions: list[dict[str, Any]]) -> str:
         chunks = []
         for action in actions[-6:]:
+            if action.get("type") == "edit_file":
+                chunks.append(
+                    json.dumps(
+                        {
+                            "type": "edit_file",
+                            "status": action.get("status"),
+                            "selection": action.get("selection"),
+                            "error": action.get("error"),
+                            "message": (
+                                f"Edit {action.get('status')} in {self.project.source_file.name}. "
+                                "The updated durable code is now visible in the context payload."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                continue
             if action.get("type") not in {"execute_session", "execute_shell"}:
                 continue
             result = action.get("result", {})
@@ -1674,6 +1707,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_error(HTTPStatus.NOT_FOUND)
         try:
             return handler(self.read_body())
+        except SourceConflictError as exc:
+            return self.send_json({"error": str(exc), "state": self.state()}, status=409)
         except subprocess.TimeoutExpired:
             return self.send_json({"error": "Command timed out after 120 seconds"}, status=408)
         except Exception as exc:
@@ -1753,7 +1788,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "first_run": workspace_first_run,
             },
             "source": project.source_file.read_text(encoding="utf-8") if project.source_file.exists() else "",
-            "source_mtime_ns": file_mtime_ns(project.source_file),
+            "source_mtime_ns": str(file_mtime_ns(project.source_file)),
             "chat": chat_store.recent(100),
             "transcript": transcript_store.recent(100),
             "active_jobs": active_job_store.list(),
@@ -1768,10 +1803,12 @@ class Handler(SimpleHTTPRequestHandler):
         }
 
     def save_source(self, body: dict[str, Any]) -> None:
+        assert_source_not_stale(body.get("source_mtime_ns"))
         project.source_file.write_text(str(body.get("source", "")), encoding="utf-8")
         self.send_json(self.state())
 
     def run_file(self, body: dict[str, Any]) -> None:
+        assert_source_not_stale(body.get("source_mtime_ns"))
         source = str(body.get("source", project.source_file.read_text(encoding="utf-8")))
         project.source_file.write_text(source, encoding="utf-8")
         result = session.execute(source, source="durable_script")
