@@ -29,6 +29,7 @@ function setStatus(text) {
 function syncPendingControls() {
   $("#chat-input").disabled = state.chatPending;
   $("#command-input").disabled = Boolean(state.terminalPending);
+  $("#clear-transcript").disabled = state.chatPending || Boolean(state.terminalPending);
   $("#compact-context").disabled = state.chatPending || Boolean(state.terminalPending);
   $("#stop-agent").hidden = !(state.chatPending || state.terminalPending);
 }
@@ -840,6 +841,10 @@ $("#mode-shell").addEventListener("click", () => {
 
 $("#clear-session").addEventListener("click", async () => {
   await postAndRefresh("/api/clear-session", {});
+});
+
+$("#clear-transcript").addEventListener("click", async () => {
+  await postAndRefresh("/api/clear-transcript", {});
 });
 
 $("#download-session").addEventListener("click", () => {

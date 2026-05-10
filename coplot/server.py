@@ -1399,10 +1399,9 @@ class AgentService:
             "```\n"
             "Use start_line N and end_line 0 to insert before line N. Use start_line 0 "
             "and end_line 0 to insert at the beginning of an empty file. "
-            "Use coplot-run freely for exploration and checks. But whenever code creates useful "
-            "analysis state, such as loaded data, transformed data, models, helper functions, "
-            "or plot code, also update the durable source with coplot-edit. The durable file "
-            "should be able to recreate the important state from a fresh session. "
+            f"Use coplot-run freely for fast exploration. Once coplot-run gives you the desired result, "
+            f"add durable code to {self.project.source_file.name} with coplot-edit. Remember, the user "
+            f"must be able to get the same result as you by simply running {self.project.source_file.name}. "
             f"{runtime_rules} The user will often ask you to visually inspect plots for feedback. "
             "You can only see plots if they have been saved as PNG files in the ./coplot/plots/ folder. "
             "If plot images are attached to the user message, inspect the image directly instead of saying "
@@ -1689,6 +1688,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/run-file": self.run_file,
             "/api/run-session": self.run_session,
             "/api/clear-session": self.clear_session,
+            "/api/clear-transcript": self.clear_transcript,
             "/api/run-shell": self.run_shell,
             "/api/chat": self.chat,
             "/api/stop": self.stop_agent,
@@ -1829,6 +1829,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.clear_chat_image_files()
         project.recreate_runtime()
         self.send_json({"result": {"ok": True, "message": "Workspace cleared."}, "state": self.state()})
+
+    def clear_transcript(self, body: dict[str, Any]) -> None:
+        project.transcript_file.write_text("", encoding="utf-8")
+        self.send_json({"result": {"ok": True, "message": "Transcript cleared."}, "state": self.state()})
 
     def clear_context(self, body: dict[str, Any]) -> None:
         self.compact_context(body)
