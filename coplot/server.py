@@ -709,7 +709,6 @@ class ArtifactStore:
         artifact_type: str,
         path: Path,
         source: str,
-        code: str,
         caption: str,
     ) -> dict[str, Any]:
         display_path = self.display_path(path)
@@ -721,7 +720,6 @@ class ArtifactStore:
             "path": display_path,
             "created_at": utc_now_iso(),
             "source": source,
-            "code": code,
             "caption": caption,
             "pinned": bool(existing.get("pinned")) if existing else False,
         }
@@ -739,7 +737,6 @@ class ArtifactStore:
         artifact_type: str,
         path: Path,
         source: str,
-        code: str,
         caption: str,
         artifact_id: int | None = None,
     ) -> dict[str, Any]:
@@ -751,7 +748,6 @@ class ArtifactStore:
                 "path": self.display_path(path),
                 "created_at": utc_now_iso(),
                 "source": source,
-                "code": code,
                 "caption": caption,
                 "pinned": False,
             },
@@ -893,7 +889,7 @@ class PythonSession:
                     "interactive": interactive,
                 }
             )
-            generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
+            generated_artifacts = self._record_changed_png_artifacts(before_pngs)
             duration_ms = int((time.perf_counter() - start) * 1000)
             entry = self.transcript.append_session(
                 language=self.language,
@@ -922,7 +918,7 @@ class PythonSession:
             snapshot[resolved] = (stat.st_mtime_ns, stat.st_size)
         return snapshot
 
-    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]], code: str) -> list[dict[str, Any]]:
+    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]]) -> list[dict[str, Any]]:
         after = self._png_snapshot()
         changed_paths = [
             path
@@ -936,7 +932,6 @@ class PythonSession:
                     artifact_type="plot",
                     path=path,
                     source="session",
-                    code=code,
                     caption=path.name,
                 )
             )
@@ -1021,7 +1016,7 @@ class RSession:
                     "interactive": interactive,
                 }
             )
-            generated_artifacts = self._record_changed_png_artifacts(before_pngs, code)
+            generated_artifacts = self._record_changed_png_artifacts(before_pngs)
             duration_ms = int((time.perf_counter() - start) * 1000)
             entry = self.transcript.append_session(
                 language=self.language,
@@ -1050,7 +1045,7 @@ class RSession:
             snapshot[resolved] = (stat.st_mtime_ns, stat.st_size)
         return snapshot
 
-    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]], code: str) -> list[dict[str, Any]]:
+    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]]) -> list[dict[str, Any]]:
         after = self._png_snapshot()
         changed_paths = [
             path
@@ -1064,7 +1059,6 @@ class RSession:
                     artifact_type="plot",
                     path=path,
                     source="session",
-                    code=code,
                     caption=path.name,
                 )
             )
@@ -1365,9 +1359,12 @@ class AgentService:
                 "available, for example renv::install(\"joey711/phyloseq\"). After installing or "
                 "upgrading R packages, run renv::snapshot(lockfile = \"coplot/renv.lock\", prompt = FALSE) "
                 "to update ./coplot/renv.lock. "
-                "R mode requires renv and jsonlite. Save plots as PNG files in ./coplot/plots/ using png(...), "
-                "ggsave(...), or another explicit file-writing API. Calling plot viewers or relying "
-                "on an interactive device does not make plots visible to you."
+                "R mode requires renv and jsonlite. Save plots as PNG files in ./coplot/plots/ using "
+                "png(...); ...; dev.off(), ggsave(...), or another explicit file-writing API. "
+                "Do not use interactive graphics devices or viewers such as quartz(), X11(), "
+                "windows(), dev.new(), or plot panes; they can open local GUI windows, block "
+                "execution, and prevent further agent iteration. Interactive graphics devices "
+                "do not make plots visible to you."
             )
         else:
             run_example = "print(df.shape)"
@@ -1384,9 +1381,10 @@ class AgentService:
                 "Use durable edits for reproducible work, session runs for scratch Python, and shell "
                 "commands for package or system checks. The Python session and shell both use the "
                 "project venv; install Python packages with python -m pip install ... so they land "
-                "in that environment. Save plots as PNG files in ./coplot/plots/. Calling plt.show() "
-                "may show a plot to the user in their local environment, but it does not make the "
-                "plot visible to you."
+                "in that environment. Save plots as PNG files in ./coplot/plots/ using plt.savefig(...) "
+                "or another explicit file-writing API, then close figures with plt.close(...). "
+                "Do not call plt.show(); it can open a local GUI window, block execution, and prevent "
+                "further agent iteration. Calling plt.show() does not make the plot visible to you."
             )
         return (
             "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
