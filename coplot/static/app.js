@@ -487,25 +487,51 @@ function formatMarkdownLite(value) {
 
 function formatMarkdownBlocks(html) {
   const lines = html.split("\n");
-  const rendered = [];
+  const blocks = [];
   for (let index = 0; index < lines.length; index += 1) {
     if (isMarkdownTableStart(lines, index)) {
       const table = collectMarkdownTable(lines, index);
-      rendered.push(renderMarkdownTable(table.rows));
+      blocks.push({ type: "table", html: renderMarkdownTable(table.rows) });
       index = table.endIndex;
       continue;
     }
-    rendered.push(formatMarkdownLine(lines[index]));
+    blocks.push(markdownLineBlock(lines[index]));
   }
-  return rendered.join("<br>");
+  return renderMarkdownBlocks(blocks);
 }
 
-function formatMarkdownLine(line) {
+function markdownLineBlock(line) {
+  if (!line.trim()) return { type: "blank", html: "" };
   const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
   if (heading) {
-    return `<div class="chat-heading"><strong>${formatMarkdownInline(heading[1])}</strong></div>`;
+    return { type: "heading", html: `<div class="chat-heading"><strong>${formatMarkdownInline(heading[1])}</strong></div>` };
   }
-  return formatMarkdownInline(line);
+  return { type: "text", html: formatMarkdownInline(line) };
+}
+
+function renderMarkdownBlocks(blocks) {
+  const html = [];
+  let pendingBlank = false;
+  let previousType = "";
+  for (const block of blocks) {
+    if (block.type === "blank") {
+      pendingBlank = html.length > 0;
+      continue;
+    }
+    const isText = block.type === "text";
+    const isPreviousText = previousType === "text";
+    const isPreviousInline = previousType === "text" || previousType === "inlineBreak";
+    if (pendingBlank && isText && isPreviousInline) {
+      html.push("<br><br>");
+      previousType = "inlineBreak";
+    } else if (!pendingBlank && isText && isPreviousText) {
+      html.push("<br>");
+    }
+    html.push(block.html);
+    previousType = block.type;
+    pendingBlank = false;
+  }
+  return html.join("");
 }
 
 function formatMarkdownInline(html) {
