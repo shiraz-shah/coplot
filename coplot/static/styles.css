@@ -1091,13 +1091,13 @@ textarea:disabled {
 }
 
 .chat-heading {
-  margin: 6px 0 2px;
+  margin: 1em 0 0;
   color: var(--text);
 }
 
 .chat-table-wrap {
   max-width: 100%;
-  margin: 4px 0;
+  margin: 0.5em 0;
   overflow-x: auto;
   white-space: normal;
 }
@@ -1118,7 +1118,7 @@ textarea:disabled {
 }
 
 .chat-table th {
-  color: var(--text);
+  color: var(--accent);
   font-weight: 700;
 }
 

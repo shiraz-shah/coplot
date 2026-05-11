@@ -554,14 +554,9 @@ function markdownTableCells(line) {
 function renderMarkdownTable(rows) {
   const header = rows[0] || [];
   const body = rows.slice(1);
-  return `
-    <div class="chat-table-wrap">
-      <table class="chat-table">
-        <thead><tr>${header.map((cell) => `<th>${formatMarkdownInline(cell)}</th>`).join("")}</tr></thead>
-        <tbody>${body.map((row) => `<tr>${header.map((_, index) => `<td>${formatMarkdownInline(row[index] || "")}</td>`).join("")}</tr>`).join("")}</tbody>
-      </table>
-    </div>
-  `;
+  const head = header.map((cell) => `<th>${formatMarkdownInline(cell)}</th>`).join("");
+  const bodyRows = body.map((row) => `<tr>${header.map((_, index) => `<td>${formatMarkdownInline(row[index] || "")}</td>`).join("")}</tr>`).join("");
+  return `<div class="chat-table-wrap"><table class="chat-table"><thead><tr>${head}</tr></thead><tbody>${bodyRows}</tbody></table></div>`;
 }
 
 function setEditorValue(value) {
