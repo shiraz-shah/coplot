@@ -471,14 +471,97 @@ function formatArtifactMeta(artifact) {
 
 function formatMarkdownLite(value) {
   let html = escapeHtml(value);
-  html = html.replace(/```coplot-edit[\s\S]*?```/gi, '<div class="action-note">Applied editor update</div>');
-  html = html.replace(/```coplot-run[\s\S]*?```/gi, '<div class="action-note">Ran session scratch code</div>');
-  html = html.replace(/```coplot-shell[\s\S]*?```/gi, '<div class="action-note">Ran shell command</div>');
-  html = html.replace(/```([\s\S]*?)```/g, "<pre class=\"output\">$1</pre>");
-  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  const blocks = [];
+  const protectBlock = (markup) => {
+    const token = `@@COPLOT_BLOCK_${blocks.length}@@`;
+    blocks.push(markup);
+    return token;
+  };
+  html = html.replace(/```coplot-edit[\s\S]*?```/gi, () => protectBlock('<div class="action-note">Applied editor update</div>'));
+  html = html.replace(/```coplot-run[\s\S]*?```/gi, () => protectBlock('<div class="action-note">Ran session scratch code</div>'));
+  html = html.replace(/```coplot-shell[\s\S]*?```/gi, () => protectBlock('<div class="action-note">Ran shell command</div>'));
+  html = html.replace(/```([\s\S]*?)```/g, (_, code) => protectBlock(`<pre class="output">${code}</pre>`));
+  html = formatMarkdownBlocks(html);
+  return html.replace(/@@COPLOT_BLOCK_(\d+)@@/g, (_, index) => blocks[Number(index)] || "");
+}
+
+function formatMarkdownBlocks(html) {
+  const lines = html.split("\n");
+  const rendered = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (isMarkdownTableStart(lines, index)) {
+      const table = collectMarkdownTable(lines, index);
+      rendered.push(renderMarkdownTable(table.rows));
+      index = table.endIndex;
+      continue;
+    }
+    rendered.push(formatMarkdownLine(lines[index]));
+  }
+  return rendered.join("<br>");
+}
+
+function formatMarkdownLine(line) {
+  const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+  if (heading) {
+    return `<div class="chat-heading"><strong>${formatMarkdownInline(heading[1])}</strong></div>`;
+  }
+  return formatMarkdownInline(line);
+}
+
+function formatMarkdownInline(html) {
+  const inlineCode = [];
+  html = html.replace(/`([^`]+)`/g, (_, code) => {
+    const token = `@@COPLOT_INLINE_${inlineCode.length}@@`;
+    inlineCode.push(`<code>${code}</code>`);
+    return token;
+  });
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/\n/g, "<br>");
-  return html;
+  return html.replace(/@@COPLOT_INLINE_(\d+)@@/g, (_, index) => inlineCode[Number(index)] || "");
+}
+
+function isMarkdownTableStart(lines, index) {
+  return index + 1 < lines.length && isMarkdownTableRow(lines[index]) && isMarkdownTableSeparator(lines[index + 1]);
+}
+
+function isMarkdownTableRow(line) {
+  const cells = markdownTableCells(line);
+  return cells.length >= 2;
+}
+
+function isMarkdownTableSeparator(line) {
+  const cells = markdownTableCells(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function collectMarkdownTable(lines, startIndex) {
+  const rows = [markdownTableCells(lines[startIndex])];
+  let index = startIndex + 2;
+  while (index < lines.length && isMarkdownTableRow(lines[index])) {
+    rows.push(markdownTableCells(lines[index]));
+    index += 1;
+  }
+  return { rows, endIndex: index - 1 };
+}
+
+function markdownTableCells(line) {
+  let trimmed = line.trim();
+  if (!trimmed.includes("|")) return [];
+  if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdownTable(rows) {
+  const header = rows[0] || [];
+  const body = rows.slice(1);
+  return `
+    <div class="chat-table-wrap">
+      <table class="chat-table">
+        <thead><tr>${header.map((cell) => `<th>${formatMarkdownInline(cell)}</th>`).join("")}</tr></thead>
+        <tbody>${body.map((row) => `<tr>${header.map((_, index) => `<td>${formatMarkdownInline(row[index] || "")}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 function setEditorValue(value) {

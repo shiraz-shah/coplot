@@ -1090,6 +1090,38 @@ textarea:disabled {
   padding: 1px 4px;
 }
 
+.chat-heading {
+  margin: 6px 0 2px;
+  color: var(--text);
+}
+
+.chat-table-wrap {
+  max-width: 100%;
+  margin: 4px 0;
+  overflow-x: auto;
+  white-space: normal;
+}
+
+.chat-table {
+  width: max-content;
+  max-width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.chat-table th,
+.chat-table td {
+  padding: 2px 12px 2px 0;
+  text-align: left;
+  vertical-align: top;
+}
+
+.chat-table th {
+  color: var(--text);
+  font-weight: 700;
+}
+
 .output {
   border-radius: 0;
   background: rgb(0 0 0 / 0.12);
