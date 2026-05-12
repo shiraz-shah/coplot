@@ -465,6 +465,11 @@ def detect_reasoning_control(endpoint_url: str, models: list[dict[str, Any]]) ->
     return endpoint_guess
 
 
+def is_llamacpp_endpoint(models: list[dict[str, Any]]) -> bool:
+    owners = {str(model.get("owned_by", "")).lower() for model in models}
+    return "llamacpp" in owners
+
+
 def resolve_reasoning_control(settings: dict[str, Any]) -> str:
     control = str(settings.get("reasoning_control") or "auto")
     if control == "auto":
@@ -486,7 +491,11 @@ def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
         {
             "id": str(model.get("id") or model.get("name") or model.get("model") or ""),
             "owned_by": str(model.get("owned_by") or ""),
-            "context_window_tokens": model.get("max_model_len") or model.get("context_length"),
+            "context_window_tokens": (
+                model.get("max_model_len")
+                or model.get("context_length")
+                or (model.get("meta") or {}).get("n_ctx_train")
+            ),
         }
         for model in models
         if model.get("id") or model.get("name") or model.get("model")
@@ -494,6 +503,8 @@ def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
     reasoning_control = detect_reasoning_control(endpoint_url, normalized)
     if reasoning_control == "ollama":
         merge_ollama_loaded_context(endpoint_url, normalized, timeout=timeout)
+    if is_llamacpp_endpoint(normalized):
+        merge_llamacpp_props_context(endpoint_url, normalized, timeout=timeout)
     return {
         "models": normalized,
         "reasoning_control": reasoning_control,
@@ -523,6 +534,29 @@ def merge_ollama_loaded_context(endpoint_url: str, models: list[dict[str, Any]],
         context_length = context_by_name.get(str(model.get("id", "")))
         if context_length:
             model["context_window_tokens"] = context_length
+
+
+def merge_llamacpp_props_context(endpoint_url: str, models: list[dict[str, Any]], timeout: int = 10) -> None:
+    endpoint = normalize_endpoint_url(endpoint_url)
+    parsed = urllib.parse.urlparse(endpoint)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    url = f"{base}/props"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return
+    settings = data.get("default_generation_settings", {})
+    if not isinstance(settings, dict):
+        return
+    context_length = settings.get("n_ctx")
+    if not context_length:
+        context_length = (settings.get("params") or {}).get("n_ctx") if isinstance(settings.get("params"), dict) else None
+    if not context_length:
+        return
+    for model in models:
+        model["context_window_tokens"] = context_length
 
 
 def estimate_tokens(value: Any) -> int:
