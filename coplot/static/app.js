@@ -944,7 +944,10 @@ $("#mode-shell").addEventListener("click", () => {
 });
 
 $("#clear-session").addEventListener("click", async () => {
-  await postAndRefresh("/api/clear-session", {});
+  const payload = await postAndRefresh("/api/clear-session", {});
+  if (payload.result?.message) {
+    setStatus(payload.result.message);
+  }
 });
 
 $("#clear-transcript").addEventListener("click", async () => {

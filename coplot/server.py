@@ -1775,20 +1775,7 @@ class Handler(SimpleHTTPRequestHandler):
     def download_session(self) -> None:
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-            if project.chat_file.exists():
-                archive.write(project.chat_file, "chat.jsonl")
-            if project.source_file.exists():
-                archive.write(project.source_file, project.source_file.name)
-            if project.plots_dir.exists():
-                archive.writestr("coplot/plots/", "")
-                for path in sorted(project.plots_dir.rglob("*")):
-                    if path.is_file():
-                        archive.write(path, path.resolve().relative_to(project.root.resolve()))
-            if project.chat_images_dir.exists():
-                archive.writestr("coplot/chat_images/", "")
-                for path in sorted(project.chat_images_dir.rglob("*")):
-                    if path.is_file():
-                        archive.write(path, path.resolve().relative_to(project.root.resolve()))
+            self.write_session_archive(archive)
         data = buffer.getvalue()
         filename = f"coplot-session-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
         self.send_response(HTTPStatus.OK)
@@ -1797,6 +1784,45 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def session_archive_filename(self, suffix: str = "") -> str:
+        return f"coplot_{datetime.now().strftime('%Y%m%d-%H%M%S')}{suffix}.zip"
+
+    def archive_current_session(self) -> Path:
+        archive_path = project.root / self.session_archive_filename()
+        counter = 2
+        while archive_path.exists():
+            archive_path = project.root / self.session_archive_filename(suffix=f"-{counter}")
+            counter += 1
+        with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            self.write_session_archive(archive)
+        return archive_path
+
+    def write_session_archive(self, archive: zipfile.ZipFile) -> None:
+        for path in (
+            project.source_file,
+            project.chat_file,
+            project.transcript_file,
+            project.summary_file,
+            project.artifacts_file,
+            project.model_settings_file,
+            project.renv_lock_file,
+        ):
+            self.write_archive_file(archive, path)
+        self.write_archive_dir(archive, project.plots_dir)
+        self.write_archive_dir(archive, project.chat_images_dir)
+
+    def write_archive_file(self, archive: zipfile.ZipFile, path: Path) -> None:
+        if path.exists() and path.is_file():
+            archive.write(path, path.resolve().relative_to(project.root.resolve()))
+
+    def write_archive_dir(self, archive: zipfile.ZipFile, path: Path) -> None:
+        if not path.exists():
+            return
+        archive.writestr(f"{path.resolve().relative_to(project.root.resolve())}/", "")
+        for child in sorted(path.rglob("*")):
+            if child.is_file():
+                archive.write(child, child.resolve().relative_to(project.root.resolve()))
 
     def state(self) -> dict[str, Any]:
         context_payload = context_builder.payload()
@@ -1852,6 +1878,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"result": result, "state": self.state()})
 
     def clear_session(self, body: dict[str, Any]) -> None:
+        archive_path = self.archive_current_session()
         session.clear()
         active_job_store.clear()
         project.source_file.write_text("", encoding="utf-8")
@@ -1862,7 +1889,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.clear_artifact_files()
         self.clear_chat_image_files()
         project.recreate_runtime()
-        self.send_json({"result": {"ok": True, "message": "Workspace cleared."}, "state": self.state()})
+        self.send_json(
+            {
+                "result": {
+                    "ok": True,
+                    "message": f"Archived session to {archive_path.name}, then cleared workspace.",
+                    "archive": str(archive_path),
+                },
+                "state": self.state(),
+            }
+        )
 
     def clear_transcript(self, body: dict[str, Any]) -> None:
         project.transcript_file.write_text("", encoding="utf-8")

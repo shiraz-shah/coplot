@@ -17,20 +17,45 @@ Open source multimodal models Like Gemma 4 and Qwen 3.6 are strong enough for re
 
 ## Install
 
-During development:
+### 1. Install prerequisites
 
+Coplot needs `venv` and `renv` to work.
+
+Python on Mac and Windows already come with `venv`. On Debian/Ubuntu, install `venv` as follows.
 ```bash
-python3 -m pip install -e .
+sudo apt install python3-venv
 ```
 
-From GitHub as an app:
+As for R, install `renv` and `jsonlite` like this, before installing Coplot:
+```bash
+Rscript -e "install.packages(c('renv', 'jsonlite'))"
+```
+
+### 2. Install Coplot with `pipx`
+
+Coplot is easiest to install with `pipx`. Install `pipx` as follows:
+
+
+```bash
+python3 -m pip install pipx
+python3 -m pipx ensurepath
+```
+
+Then close and reopen your terminal, and:
+
+### 3. Install Coplot
 
 ```bash
 pipx install git+https://github.com/shiraz-shah/coplot.git
 ```
 
-## Run
+If you already installed Coplot and want the latest version:
 
+```bash
+pipx upgrade coplot
+```
+
+## Run Coplot
 Point coplot at a workspace folder containing the data you want to analyze:
 
 ```bash
