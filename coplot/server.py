@@ -201,6 +201,7 @@ class ProjectState:
     model_settings_file: Path
     plots_dir: Path
     chat_images_dir: Path
+    results_dir: Path
     language: str = "python"
 
     @classmethod
@@ -217,6 +218,7 @@ class ProjectState:
             model_settings_file=agent_data_dir / "config.json",
             plots_dir=agent_data_dir / "plots",
             chat_images_dir=agent_data_dir / "chat_images",
+            results_dir=agent_data_dir / "results",
         )
 
     @property
@@ -254,6 +256,7 @@ class ProjectState:
             model_settings_file=self.model_settings_file,
             plots_dir=self.plots_dir,
             chat_images_dir=self.chat_images_dir,
+            results_dir=self.results_dir,
             language=normalize_language(language),
         )
 
@@ -262,6 +265,7 @@ class ProjectState:
         self.agent_data_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
         self.chat_images_dir.mkdir(parents=True, exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
         if not self.summary_file.exists():
             self.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
         self.chat_file.touch(exist_ok=True)
@@ -1398,7 +1402,9 @@ class AgentService:
                 "Do not use interactive graphics devices or viewers such as quartz(), X11(), "
                 "windows(), dev.new(), or plot panes; they can open local GUI windows, block "
                 "execution, and prevent further agent iteration. Interactive graphics devices "
-                "do not make plots visible to you."
+                "do not make plots visible to you.\n\nSave processed output (e.g. TSVs, RDS "
+                "files, report.md) in ./coplot/results/. Keep the ./coplot/ folder root clean "
+                "from artifacts."
             )
         else:
             run_example = "print(df.shape)"
@@ -1418,7 +1424,9 @@ class AgentService:
                 "in that environment. Save plots as PNG files in ./coplot/plots/ using plt.savefig(...) "
                 "or another explicit file-writing API, then close figures with plt.close(...). "
                 "Do not call plt.show(); it can open a local GUI window, block execution, and prevent "
-                "further agent iteration. Calling plt.show() does not make the plot visible to you."
+                "further agent iteration. Calling plt.show() does not make the plot visible to you.\n\n"
+                "Save processed output (e.g. TSVs, npz files, report.md) in ./coplot/results/. "
+                "Keep the ./coplot/ folder root clean from artifacts."
             )
         return (
             "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
@@ -1800,17 +1808,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def write_session_archive(self, archive: zipfile.ZipFile) -> None:
         for path in (
-            project.source_file,
-            project.chat_file,
-            project.transcript_file,
-            project.summary_file,
-            project.artifacts_file,
-            project.model_settings_file,
-            project.renv_lock_file,
+            project.root / "coplot.py",
+            project.root / "coplot.R",
         ):
             self.write_archive_file(archive, path)
-        self.write_archive_dir(archive, project.plots_dir)
-        self.write_archive_dir(archive, project.chat_images_dir)
+        self.write_archive_dir(archive, project.agent_data_dir)
 
     def write_archive_file(self, archive: zipfile.ZipFile, path: Path) -> None:
         if path.exists() and path.is_file():
@@ -1821,8 +1823,29 @@ class Handler(SimpleHTTPRequestHandler):
             return
         archive.writestr(f"{path.resolve().relative_to(project.root.resolve())}/", "")
         for child in sorted(path.rglob("*")):
-            if child.is_file():
+            relative_child = child.resolve().relative_to(path.resolve())
+            if self.should_skip_archive_path(relative_child):
+                continue
+            if child.is_dir():
+                archive.writestr(f"{child.resolve().relative_to(project.root.resolve())}/", "")
+            elif child.is_file():
                 archive.write(child, child.resolve().relative_to(project.root.resolve()))
+
+    def should_skip_archive_path(self, relative_path: Path) -> bool:
+        excluded_dirs = {
+            "venv",
+            "renv",
+            ".venv",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".ipynb_checkpoints",
+        }
+        excluded_files = {".DS_Store", "Thumbs.db"}
+        if any(part in excluded_dirs for part in relative_path.parts):
+            return True
+        return relative_path.name in excluded_files
 
     def state(self) -> dict[str, Any]:
         context_payload = context_builder.payload()
@@ -1880,15 +1903,7 @@ class Handler(SimpleHTTPRequestHandler):
     def clear_session(self, body: dict[str, Any]) -> None:
         archive_path = self.archive_current_session()
         session.clear()
-        active_job_store.clear()
-        project.source_file.write_text("", encoding="utf-8")
-        project.chat_file.write_text("", encoding="utf-8")
-        project.transcript_file.write_text("", encoding="utf-8")
-        project.summary_file.write_text("# coplot Session Summary\n\n", encoding="utf-8")
-        artifact_store.clear()
-        self.clear_artifact_files()
-        self.clear_chat_image_files()
-        project.recreate_runtime()
+        self.reset_workspace_to_first_run()
         self.send_json(
             {
                 "result": {
@@ -1899,6 +1914,16 @@ class Handler(SimpleHTTPRequestHandler):
                 "state": self.state(),
             }
         )
+
+    def reset_workspace_to_first_run(self) -> None:
+        root = project.root
+        for source_name in ("coplot.py", "coplot.R"):
+            source_path = root / source_name
+            if source_path.exists() and source_path.is_file():
+                source_path.unlink()
+        if project.agent_data_dir.exists():
+            shutil.rmtree(project.agent_data_dir)
+        configure_app(root)
 
     def clear_transcript(self, body: dict[str, Any]) -> None:
         project.transcript_file.write_text("", encoding="utf-8")
