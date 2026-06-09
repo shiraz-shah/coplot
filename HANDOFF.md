@@ -1,5 +1,14 @@
 # coplot Handoff
 
+## Release Checklist
+
+Before committing changes:
+
+- Bump `version` in `pyproject.toml`.
+- Keep `setup.py` metadata delegated to `pyproject.toml`.
+- Commit the version bump with the feature/fix so `pipx upgrade coplot`
+  detects a new installable version.
+
 ## Current Direction
 
 coplot supports Python and R in one codebase, but each workspace is locked to
@@ -234,6 +243,8 @@ Important behavior:
 - The editor is a textarea plus syntax-highlight mirror.
 - `Cmd/Ctrl+Enter` runs selected code, or the current line when nothing is
   selected, then moves the cursor to the next line.
+- `Cmd/Ctrl+Shift+Space` mirrors the shared mic/stop button: start recording,
+  stop/send recording, or stop pending work.
 - The transcript renders completed entries and backend `active_jobs`.
 - The artifact pane shows the latest plot and opens fullscreen on click.
 - Settings modal handles the prominent R/Python language switch, endpoint

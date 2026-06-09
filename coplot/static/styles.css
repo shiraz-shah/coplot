@@ -819,6 +819,37 @@ textarea:disabled {
   background: #232a39;
 }
 
+#record-audio {
+  color: var(--accent);
+  display: grid;
+  font-size: 0;
+  padding: 0;
+  place-items: center;
+}
+
+#record-audio::before {
+  content: "";
+  display: block;
+  width: 12px;
+  height: 12px;
+  background: currentColor;
+  border-radius: 999px;
+}
+
+#record-audio.recording {
+  animation: pending-glow 900ms ease-in-out infinite;
+  background: rgb(255 119 111 / 0.22);
+  color: var(--bad);
+}
+
+#record-audio.stopping {
+  color: var(--bad);
+}
+
+#record-audio.stopping::before {
+  border-radius: 0;
+}
+
 .composer button[hidden] {
   display: none;
 }

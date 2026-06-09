@@ -5,7 +5,9 @@ const state = {
   chatPending: false,
   pendingChatMessage: "",
   chatImages: [],
+  chatAudio: [],
   pendingChatImages: [],
+  pendingChatAudio: [],
   terminalPending: null,
   fullscreenArtifactIndex: null,
   settingsDialogShown: false,
@@ -16,6 +18,11 @@ const state = {
   endpointModels: [],
   pendingPollTimer: null,
   pendingChatBaselineLength: 0,
+  audioRecorder: null,
+  audioChunks: [],
+  audioStream: null,
+  audioRecordingStartedAt: 0,
+  audioRecording: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -27,11 +34,19 @@ function setStatus(text) {
 }
 
 function syncPendingControls() {
+  const workPending = state.chatPending || Boolean(state.terminalPending);
+  const recordButton = $("#record-audio");
   $("#chat-input").disabled = state.chatPending;
+  recordButton.disabled = false;
+  recordButton.classList.toggle("recording", state.audioRecording);
+  recordButton.classList.toggle("stopping", workPending);
+  recordButton.title = workPending
+    ? "Stop after the current action"
+    : state.audioRecording ? "Stop recording" : "Record voice message";
+  recordButton.setAttribute("aria-label", recordButton.title);
   $("#command-input").disabled = Boolean(state.terminalPending);
   $("#clear-transcript").disabled = state.chatPending || Boolean(state.terminalPending);
   $("#compact-context").disabled = state.chatPending || Boolean(state.terminalPending);
-  $("#stop-agent").hidden = !(state.chatPending || state.terminalPending);
 }
 
 async function api(path, options = {}) {
@@ -112,7 +127,7 @@ function renderChat(entries) {
   const shouldStickToBottom = shouldAutoScrollToBottom(log);
   const previousScrollTop = log.scrollTop;
   log.innerHTML = "";
-  if (!entries.length && !state.chatPending && !state.pendingChatMessage) {
+  if (!entries.length && !state.chatPending && !state.pendingChatMessage && !state.pendingChatImages.length && !state.pendingChatAudio.length) {
     log.innerHTML = '<div class="empty">No chat yet.</div>';
     restoreScrollPosition(log, shouldStickToBottom, previousScrollTop);
     return;
@@ -151,12 +166,13 @@ function restoreScrollPosition(element, shouldStickToBottom, previousScrollTop) 
 }
 
 function shouldRenderPendingUserMessage(entries) {
-  if (!state.pendingChatMessage && !state.pendingChatImages.length) return false;
+  const pendingAttachmentCount = state.pendingChatImages.length + state.pendingChatAudio.length;
+  if (!state.pendingChatMessage && !pendingAttachmentCount) return false;
   const newEntries = entries.slice(state.pendingChatBaselineLength);
   const serverHasPendingMessage = newEntries.some(
     (entry) => entry.role === "user" &&
       entry.content === state.pendingChatMessage &&
-      (entry.attachments || []).length === state.pendingChatImages.length
+      (entry.attachments || []).length === pendingAttachmentCount
   );
   return !serverHasPendingMessage;
 }
@@ -166,21 +182,22 @@ function renderPendingUserMessage(content) {
   item.className = "message user pending-user-message";
   item.innerHTML = `
     <div class="label">user</div>
-    ${renderAttachmentChips(state.pendingChatImages)}
+    ${renderAttachmentChips([...state.pendingChatAudio, ...state.pendingChatImages])}
     <div class="content">${formatMarkdownLite(content)}</div>
   `;
   return item;
 }
 
 function renderAttachmentChips(attachments) {
-  const imageAttachments = (attachments || []).filter((attachment) => attachment.type === "image");
-  if (!imageAttachments.length) return "";
+  const visibleAttachments = (attachments || []).filter((attachment) => ["audio", "image"].includes(attachment.type));
+  if (!visibleAttachments.length) return "";
   return `
     <div class="message-attachments">
-      ${imageAttachments.map((attachment) => `
+      ${visibleAttachments.map((attachment) => `
         <span class="attachment-chip" title="${escapeHtml(formatAttachmentTitle(attachment))}">
-          <span aria-hidden="true">▧</span>
-          <span>PNG</span>
+          <span aria-hidden="true">${attachment.type === "audio" ? "●" : "▧"}</span>
+          <span>${attachment.type === "audio" ? "WAV" : "PNG"}</span>
+          ${attachment.duration_ms ? `<span>${escapeHtml(formatDuration(attachment.duration_ms))}</span>` : ""}
           <span>${escapeHtml(formatBytes(attachment.size_bytes || 0))}</span>
         </span>
       `).join("")}
@@ -190,13 +207,22 @@ function renderAttachmentChips(attachments) {
 
 function renderChatAttachments() {
   const tray = $("#chat-attachments");
-  if (!state.chatImages.length) {
+  if (!state.chatImages.length && !state.chatAudio.length) {
     tray.hidden = true;
     tray.innerHTML = "";
     return;
   }
   tray.hidden = false;
-  tray.innerHTML = state.chatImages.map((image, index) => `
+  const audioHtml = state.chatAudio.map((audio, index) => `
+    <span class="attachment-chip composer-attachment" title="${escapeHtml(formatAttachmentTitle(audio))}">
+      <span aria-hidden="true">●</span>
+      <span>WAV</span>
+      <span>${escapeHtml(formatDuration(audio.duration_ms))}</span>
+      <span>${escapeHtml(formatBytes(audio.size_bytes))}</span>
+      <button type="button" data-remove-audio="${index}" title="Remove audio" aria-label="Remove audio">×</button>
+    </span>
+  `).join("");
+  const imageHtml = state.chatImages.map((image, index) => `
     <span class="attachment-chip composer-attachment" title="${escapeHtml(image.name || "Pasted PNG")}">
       <span aria-hidden="true">▧</span>
       <span>PNG</span>
@@ -204,6 +230,14 @@ function renderChatAttachments() {
       <button type="button" data-remove-image="${index}" title="Remove image" aria-label="Remove image">×</button>
     </span>
   `).join("");
+  tray.innerHTML = `${audioHtml}${imageHtml}`;
+  tray.querySelectorAll("[data-remove-audio]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.chatAudio.splice(Number(button.dataset.removeAudio), 1);
+      renderChatAttachments();
+      $("#chat-input").focus();
+    });
+  });
   tray.querySelectorAll("[data-remove-image]").forEach((button) => {
     button.addEventListener("click", () => {
       state.chatImages.splice(Number(button.dataset.removeImage), 1);
@@ -214,13 +248,23 @@ function renderChatAttachments() {
 }
 
 function formatAttachmentTitle(attachment) {
-  return `${attachment.mime_type || "image/png"} · ${formatBytes(attachment.size_bytes || 0)}`;
+  const parts = [attachment.mime_type || "image/png"];
+  if (attachment.duration_ms) parts.push(formatDuration(attachment.duration_ms));
+  parts.push(formatBytes(attachment.size_bytes || 0));
+  return parts.join(" · ");
 }
 
 function formatBytes(bytes) {
   const value = Number(bytes || 0);
   if (value < 1024) return `${value} B`;
   return `${Math.round(value / 102.4) / 10} KB`;
+}
+
+function formatDuration(durationMs) {
+  const seconds = Math.max(0, Math.round(Number(durationMs || 0) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}:${String(remainder).padStart(2, "0")}`;
 }
 
 function renderTypingMessage() {
@@ -437,7 +481,7 @@ function openSettingsDialog({ firstRun = false } = {}) {
 }
 
 function maybeOpenFirstRunSettings() {
-  if (state.settingsDialogShown || !state.data?.project?.first_run) return;
+  if (!state.data?.project?.first_run || $("#model-settings-dialog").open) return;
   openSettingsDialog({ firstRun: true });
 }
 
@@ -648,6 +692,7 @@ async function postAndRefresh(path, body, options = {}) {
   state.chatPending = Boolean(options.chatPending);
   state.pendingChatMessage = options.pendingChatMessage || "";
   state.pendingChatImages = options.pendingChatImages || [];
+  state.pendingChatAudio = options.pendingChatAudio || [];
   state.terminalPending = options.terminalPending || null;
   renderPendingState();
   startPendingPoll();
@@ -667,11 +712,12 @@ async function postAndRefresh(path, body, options = {}) {
     state.chatPending = false;
     state.pendingChatMessage = "";
     state.pendingChatImages = [];
+    state.pendingChatAudio = [];
     state.pendingChatBaselineLength = 0;
     state.terminalPending = null;
     stopPendingPoll();
     syncPendingControls();
-    render({ forceSource: options.savedSource !== undefined || Boolean(state.pendingEditorSelection) });
+    render({ forceSource: Boolean(options.forceSource) || options.savedSource !== undefined || Boolean(state.pendingEditorSelection) });
     return payload;
   } catch (error) {
     if (error.status === 409 && error.payload?.state) {
@@ -679,6 +725,7 @@ async function postAndRefresh(path, body, options = {}) {
       state.editorDirty = false;
       state.pendingChatMessage = "";
       state.pendingChatImages = [];
+      state.pendingChatAudio = [];
       state.pendingChatBaselineLength = 0;
       state.terminalPending = null;
       state.chatPending = false;
@@ -691,6 +738,7 @@ async function postAndRefresh(path, body, options = {}) {
     state.chatPending = false;
     state.pendingChatMessage = "";
     state.pendingChatImages = [];
+    state.pendingChatAudio = [];
     state.pendingChatBaselineLength = 0;
     state.terminalPending = null;
     stopPendingPoll();
@@ -944,7 +992,8 @@ $("#mode-shell").addEventListener("click", () => {
 });
 
 $("#clear-session").addEventListener("click", async () => {
-  const payload = await postAndRefresh("/api/clear-session", {});
+  state.settingsDialogShown = false;
+  const payload = await postAndRefresh("/api/clear-session", {}, { forceSource: true });
   if (payload.result?.message) {
     setStatus(payload.result.message);
   }
@@ -983,15 +1032,17 @@ $("#command-input").addEventListener("keydown", (event) => {
 $("#chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("#chat-input").value.trim();
-  if (!input && !state.chatImages.length) return;
+  if (!input && !state.chatImages.length && !state.chatAudio.length) return;
   const images = state.chatImages.slice();
+  const audio = state.chatAudio.slice();
   $("#chat-input").value = "";
   state.chatImages = [];
+  state.chatAudio = [];
   renderChatAttachments();
   await postAndRefresh(
     "/api/chat",
-    { message: input, images },
-    { chatPending: true, pendingChatMessage: input, pendingChatImages: images }
+    { message: input, images, audio },
+    { chatPending: true, pendingChatMessage: input, pendingChatImages: images, pendingChatAudio: audio }
   );
 });
 
@@ -1038,6 +1089,27 @@ $("#chat-input").addEventListener("paste", async (event) => {
   renderChatAttachments();
 });
 
+$("#record-audio").addEventListener("click", activateAudioControl);
+
+async function activateAudioControl() {
+  if (state.chatPending || state.terminalPending) {
+    await stopCurrentWork();
+    return;
+  }
+  if (state.audioRecording) {
+    await stopAudioRecording();
+    return;
+  }
+  await startAudioRecording();
+}
+
+async function stopCurrentWork() {
+  await api("/api/stop", { method: "POST", body: JSON.stringify({}) });
+  state.chatPending = false;
+  state.terminalPending = null;
+  await refresh();
+}
+
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1045,6 +1117,147 @@ function readFileAsDataUrl(file) {
     reader.addEventListener("error", () => reject(reader.error || new Error("Failed to read pasted image.")));
     reader.readAsDataURL(file);
   });
+}
+
+async function startAudioRecording() {
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    setStatus("Audio recording is not supported in this browser.");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const recorder = new MediaRecorder(stream);
+    state.audioStream = stream;
+    state.audioChunks = [];
+    state.audioRecorder = recorder;
+    state.audioRecordingStartedAt = Date.now();
+    recorder.addEventListener("dataavailable", (event) => {
+      if (event.data && event.data.size) state.audioChunks.push(event.data);
+    });
+    recorder.addEventListener("stop", handleAudioRecordingStopped, { once: true });
+    recorder.start();
+    state.audioRecording = true;
+    syncPendingControls();
+    setStatus("Recording");
+  } catch (error) {
+    setStatus(error.message || "Could not start audio recording.");
+    cleanupAudioRecording();
+  }
+}
+
+async function stopAudioRecording() {
+  const recorder = state.audioRecorder;
+  if (!recorder || recorder.state === "inactive") return;
+  recorder.stop();
+  state.audioRecording = false;
+  syncPendingControls();
+  setStatus("Processing audio");
+}
+
+async function handleAudioRecordingStopped() {
+  try {
+    const durationMs = Math.max(1, Date.now() - state.audioRecordingStartedAt);
+    const recorded = new Blob(state.audioChunks, { type: state.audioRecorder?.mimeType || "audio/webm" });
+    cleanupAudioRecording();
+    const wavBlob = await recordedBlobTo16kWav(recorded);
+    const dataUrl = await readFileAsDataUrl(wavBlob);
+    const audio = {
+      type: "audio",
+      mime_type: "audio/wav",
+      format: "wav",
+      name: "voice-message.wav",
+      duration_ms: durationMs,
+      size_bytes: wavBlob.size,
+      data_url: dataUrl,
+    };
+    state.chatAudio = [audio];
+    renderChatAttachments();
+    setStatus("Ready");
+    if (!$("#chat-input").value.trim()) {
+      $("#chat-form").requestSubmit();
+    } else {
+      $("#chat-input").focus();
+    }
+  } catch (error) {
+    cleanupAudioRecording();
+    setStatus(error.message || "Could not process audio recording.");
+  }
+}
+
+function cleanupAudioRecording() {
+  if (state.audioStream) {
+    state.audioStream.getTracks().forEach((track) => track.stop());
+  }
+  state.audioStream = null;
+  state.audioRecorder = null;
+  state.audioChunks = [];
+  state.audioRecordingStartedAt = 0;
+  state.audioRecording = false;
+  syncPendingControls();
+}
+
+async function recordedBlobTo16kWav(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass || typeof OfflineAudioContext === "undefined") {
+    throw new Error("Audio conversion is not supported in this browser.");
+  }
+  const context = new AudioContextClass();
+  try {
+    const decoded = await context.decodeAudioData(arrayBuffer.slice(0));
+    const resampled = await resampleTo16kMono(decoded);
+    return encodePcm16Wav(resampled);
+  } finally {
+    await context.close();
+  }
+}
+
+async function resampleTo16kMono(audioBuffer) {
+  const sampleRate = 16000;
+  const frameCount = Math.max(1, Math.ceil(audioBuffer.duration * sampleRate));
+  const offline = new OfflineAudioContext(1, frameCount, sampleRate);
+  const source = offline.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(offline.destination);
+  source.start(0);
+  return await offline.startRendering();
+}
+
+function encodePcm16Wav(audioBuffer) {
+  const samples = audioBuffer.getChannelData(0);
+  const bytesPerSample = 2;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, 16000, true);
+  view.setUint32(28, 16000 * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (const sample of samples) {
+    const clamped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeAscii(view, offset, text) {
+  for (let index = 0; index < text.length; index += 1) {
+    view.setUint8(offset + index, text.charCodeAt(index));
+  }
 }
 
 document.addEventListener("keydown", async (event) => {
@@ -1062,6 +1275,12 @@ document.addEventListener("keydown", async (event) => {
 
   const commandOrControl = event.metaKey || event.ctrlKey;
   if (!commandOrControl) return;
+
+  if (event.shiftKey && event.code === "Space") {
+    event.preventDefault();
+    await activateAudioControl();
+    return;
+  }
 
   if (event.key === "Enter") {
     event.preventDefault();
@@ -1081,6 +1300,7 @@ $("#open-model-settings").addEventListener("click", () => {
 
 $("#close-model-settings").addEventListener("click", () => {
   $("#model-settings-dialog").close();
+  state.settingsDialogShown = false;
 });
 
 $("#connect-model-endpoint").addEventListener("click", async () => {
@@ -1142,17 +1362,11 @@ $("#model-settings-form").addEventListener("submit", async (event) => {
   await postAndRefresh(path, readModelSettingsForm());
   $("#model-settings-dialog").close();
   state.settingsFirstRun = false;
+  state.settingsDialogShown = false;
 });
 
 $("#compact-context").addEventListener("click", async () => {
   await postAndRefresh("/api/compact-context", {}, { chatPending: true });
-});
-
-$("#stop-agent").addEventListener("click", async () => {
-  await api("/api/stop", { method: "POST", body: JSON.stringify({}) });
-  state.chatPending = false;
-  state.terminalPending = null;
-  await refresh();
 });
 
 $("#close-context").addEventListener("click", () => {

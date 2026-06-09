@@ -37,6 +37,7 @@ SHELL_BLOCK_RE = re.compile(r"```coplot-shell[ \t]*\n(?P<command>.*?)```", re.DO
 TRANSCRIPT_OUTPUT_LIMIT_BYTES = 8 * 1024
 TRANSCRIPT_OUTPUT_EDGE_BYTES = 4 * 1024
 MAX_CHAT_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_CHAT_AUDIO_BYTES = 10 * 1024 * 1024
 TRANSCRIPT_TRUNCATION_MARKER = (
     "\n\n[Output truncated: showing first 4 KiB and last 4 KiB. "
     "Run a more specific command to inspect more.]\n\n"
@@ -1228,11 +1229,19 @@ class AgentService:
         self.shell = shell
         self.settings = settings
 
-    def respond(self, message: str, images: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def respond(
+        self,
+        message: str,
+        images: list[dict[str, Any]] | None = None,
+        audio: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         global stop_requested
         stop_requested = False
-        attachments = self._save_chat_images(images or [])
-        self.chat.append("user", message, attachments=attachments)
+        attachments = [
+            *self._prepare_chat_audio(audio or []),
+            *self._save_chat_images(images or []),
+        ]
+        self.chat.append("user", message, attachments=self._chat_attachment_metadata(attachments))
         actions: list[dict[str, Any]] = []
         assistant = self._request_and_apply(message, action_feedback="", attachments=attachments)
         pending_actions = assistant["actions"]
@@ -1250,6 +1259,15 @@ class AgentService:
         if stop_requested:
             self.chat.append("system", "Agent stopped by user.")
         return {"message": assistant["message"], "actions": actions, "stopped": stop_requested}
+
+    def _chat_attachment_metadata(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        metadata = []
+        for attachment in attachments:
+            copied = dict(attachment)
+            copied.pop("data", None)
+            copied.pop("data_url", None)
+            metadata.append(copied)
+        return metadata
 
     def compact_context(self) -> dict[str, Any]:
         settings = self.settings.read()
@@ -1323,6 +1341,35 @@ class AgentService:
             )
         return attachments
 
+    def _prepare_chat_audio(self, audio_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        attachments: list[dict[str, Any]] = []
+        for audio in audio_items:
+            mime_type = str(audio.get("mime_type") or audio.get("type") or "").strip().lower()
+            data_url = str(audio.get("data_url") or "")
+            if mime_type not in {"audio/wav", "audio/wave", "audio/x-wav"}:
+                raise ValueError("Only WAV audio is supported.")
+            if not data_url.startswith("data:audio/wav;base64,"):
+                raise ValueError("WAV audio data is invalid.")
+            data = data_url.split(",", 1)[1]
+            try:
+                raw = base64.b64decode(data, validate=True)
+            except (binascii.Error, IndexError) as exc:
+                raise ValueError("WAV audio data is invalid.") from exc
+            if len(raw) > MAX_CHAT_AUDIO_BYTES:
+                raise ValueError("WAV audio is too large.")
+            attachments.append(
+                {
+                    "id": str(uuid4()),
+                    "type": "audio",
+                    "mime_type": "audio/wav",
+                    "format": "wav",
+                    "data": data,
+                    "size_bytes": len(raw),
+                    "duration_ms": int(audio.get("duration_ms") or 0),
+                }
+            )
+        return attachments
+
     def _request_and_apply(
         self,
         message: str,
@@ -1342,6 +1389,7 @@ class AgentService:
             context["action_feedback"] = action_feedback
         prompt = self._system_prompt(context)
         user_content = self._user_content(message, attachments=attachments or [])
+        has_audio = self._has_audio_attachments(attachments or [])
         payload = {
             "model": model,
             "messages": [
@@ -1363,6 +1411,8 @@ class AgentService:
             with urllib.request.urlopen(request, timeout=int(settings["timeout_seconds"])) as response:
                 data = json.loads(response.read().decode("utf-8"))
             content = self._extract_chat_text(data)
+        except urllib.error.HTTPError as exc:
+            content = "Audio not supported by this endpoint." if has_audio else f"Model request failed: {exc}"
         except (urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
             content = f"Model request failed: {exc}"
 
@@ -1509,7 +1559,19 @@ class AgentService:
 
     def _user_content(self, message: str, *, attachments: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
         if attachments:
-            parts: list[dict[str, Any]] = [{"type": "text", "text": message or "Please inspect the attached image."}]
+            parts: list[dict[str, Any]] = []
+            for attachment in attachments:
+                if attachment.get("type") == "audio":
+                    parts.append(
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": str(attachment.get("data") or ""),
+                                "format": str(attachment.get("format") or "wav"),
+                            },
+                        }
+                    )
+            parts.append({"type": "text", "text": message or self._default_attachment_prompt(attachments)})
             for attachment in attachments:
                 data_url = self._chat_attachment_data_url(attachment)
                 if data_url:
@@ -1525,6 +1587,14 @@ class AgentService:
             if data_url:
                 parts.append({"type": "image_url", "image_url": {"url": data_url}})
         return parts if len(parts) > 1 else message
+
+    def _default_attachment_prompt(self, attachments: list[dict[str, Any]]) -> str:
+        if any(attachment.get("type") == "audio" for attachment in attachments):
+            return "Please answer the spoken request in the attached audio."
+        return "Please inspect the attached image."
+
+    def _has_audio_attachments(self, attachments: list[dict[str, Any]]) -> bool:
+        return any(attachment.get("type") == "audio" for attachment in attachments)
 
     def _chat_attachment_data_url(self, attachment: dict[str, Any]) -> str | None:
         if attachment.get("mime_type") != "image/png":
@@ -1635,11 +1705,13 @@ def configure_app(workspace_root: Path) -> None:
     discovered = ProjectState.discover(workspace_root)
     discovered.ensure_base()
     model_settings_store = ModelSettingsStore(discovered.model_settings_file, DEFAULTS_FILE)
-    model_settings_store.ensure_workspace_config()
+    had_workspace_config = discovered.model_settings_file.exists()
+    if not had_workspace_config:
+        model_settings_store.ensure_workspace_config()
     settings = model_settings_store.read()
     language = infer_workspace_language(discovered, settings)
     project = discovered.with_language(language)
-    workspace_first_run = not is_workspace_setup_complete(discovered, settings, language)
+    workspace_first_run = not is_workspace_setup_complete(discovered, settings, language, had_workspace_config)
     if not workspace_first_run:
         model_settings_store.write({"language": language, "workspace_setup_complete": True})
         project.source_file.touch(exist_ok=True)
@@ -1654,14 +1726,23 @@ def infer_workspace_language(project_state: ProjectState, settings: dict[str, An
     language = normalize_language(settings.get("language", "python"))
     if bool(settings.get("workspace_setup_complete")):
         return language
+    if (project_state.root / "coplot.py").exists() and not (project_state.root / "coplot.R").exists():
+        return "python"
     if (project_state.root / "coplot.R").exists() and not (project_state.root / "coplot.py").exists():
         return "r"
     return language
 
 
-def is_workspace_setup_complete(project_state: ProjectState, settings: dict[str, Any], language: str) -> bool:
+def is_workspace_setup_complete(
+    project_state: ProjectState,
+    settings: dict[str, Any],
+    language: str,
+    had_workspace_config: bool,
+) -> bool:
     if bool(settings.get("workspace_setup_complete")):
         return True
+    if had_workspace_config:
+        return False
     if not project_state.model_settings_file.exists():
         return False
     source_file = project_state.root / ("coplot.R" if language == "r" else "coplot.py")
@@ -1821,15 +1902,17 @@ class Handler(SimpleHTTPRequestHandler):
     def write_archive_dir(self, archive: zipfile.ZipFile, path: Path) -> None:
         if not path.exists():
             return
-        archive.writestr(f"{path.resolve().relative_to(project.root.resolve())}/", "")
+        archive.writestr(f"{path.relative_to(project.root)}/", "")
         for child in sorted(path.rglob("*")):
-            relative_child = child.resolve().relative_to(path.resolve())
+            relative_child = child.relative_to(path)
             if self.should_skip_archive_path(relative_child):
                 continue
+            if child.is_symlink():
+                continue
             if child.is_dir():
-                archive.writestr(f"{child.resolve().relative_to(project.root.resolve())}/", "")
+                archive.writestr(f"{child.relative_to(project.root)}/", "")
             elif child.is_file():
-                archive.write(child, child.resolve().relative_to(project.root.resolve()))
+                archive.write(child, child.relative_to(project.root))
 
     def should_skip_archive_path(self, relative_path: Path) -> bool:
         excluded_dirs = {
@@ -1961,7 +2044,10 @@ class Handler(SimpleHTTPRequestHandler):
         images = body.get("images", [])
         if not isinstance(images, list):
             images = []
-        result = agent_service.respond(str(body.get("message", "")), images=images)
+        audio = body.get("audio", [])
+        if not isinstance(audio, list):
+            audio = []
+        result = agent_service.respond(str(body.get("message", "")), images=images, audio=audio)
         self.send_json({"result": result, "state": self.state()})
 
     def stop_agent(self, body: dict[str, Any]) -> None:
