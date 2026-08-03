@@ -490,6 +490,19 @@ dialog::backdrop {
   color: var(--bad);
 }
 
+.settings-detail {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-detail span:last-child {
+  color: var(--text);
+  text-align: right;
+}
+
 @media (max-width: 820px) {
   body {
     overflow: auto;

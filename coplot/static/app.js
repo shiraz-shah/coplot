@@ -107,10 +107,11 @@ function renderContextMeter(usage) {
   const breakdown = usage.breakdown || {};
   element.title = [
     "Approximate context size sent with the next model request.",
+    `workspace: ~${Math.round((breakdown.workspace || 0) / 100) / 10}k`,
+    `summary: ~${Math.round((breakdown.session_summary || 0) / 100) / 10}k`,
+    `events: ~${Math.round((breakdown.recent_events || 0) / 100) / 10}k`,
     `code: ~${Math.round((breakdown.durable_code || 0) / 100) / 10}k`,
-    `chat: ~${Math.round((breakdown.recent_chat || 0) / 100) / 10}k`,
-    `transcript: ~${Math.round((breakdown.recent_transcript || 0) / 100) / 10}k`,
-    `artifacts: ~${Math.round((breakdown.artifacts || 0) / 100) / 10}k`,
+    `artifact ledger: ~${Math.round((breakdown.artifact_ledger || 0) / 100) / 10}k`,
   ].join("\n");
 }
 
@@ -386,6 +387,7 @@ function renderModelSettings(settings) {
   $("#setting-timeout").value = settings.timeout_seconds || 600;
   $("#setting-reasoning-enabled").checked = Boolean(settings.reasoning_enabled);
   $("#setting-reasoning-control").value = settings.reasoning_control || "auto";
+  setSupportedModalities(settings.supported_modalities || []);
 }
 
 function readModelSettingsForm() {
@@ -399,6 +401,7 @@ function readModelSettingsForm() {
     timeout_seconds: Number($("#setting-timeout").value),
     reasoning_enabled: $("#setting-reasoning-enabled").checked,
     reasoning_control: $("#setting-reasoning-control").value || "auto",
+    supported_modalities: readSupportedModalities(),
   };
 }
 
@@ -422,6 +425,22 @@ function selectedModelContextWindow(models, selectedModel) {
   const match = (models || []).find((model) => model.id === selectedModel);
   const value = Number(match?.context_window_tokens || 0);
   return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function normalizeModalities(modalities) {
+  return [...new Set(
+    (modalities || []).map((item) => String(item).trim().toLowerCase()).filter(Boolean)
+  )].sort();
+}
+
+function setSupportedModalities(modalities) {
+  const normalized = normalizeModalities(modalities);
+  $("#setting-supported-modalities").value = normalized.join(",");
+  $("#setting-modalities-display").textContent = normalized.length ? normalized.join(", ") : "Unknown";
+}
+
+function readSupportedModalities() {
+  return normalizeModalities($("#setting-supported-modalities").value.split(","));
 }
 
 function setSettingsMessage(message, isError = false) {
@@ -1303,6 +1322,10 @@ $("#close-model-settings").addEventListener("click", () => {
   state.settingsDialogShown = false;
 });
 
+$("#setting-endpoint-url").addEventListener("input", () => {
+  setSupportedModalities([]);
+});
+
 $("#connect-model-endpoint").addEventListener("click", async () => {
   const endpointUrl = $("#setting-endpoint-url").value.trim();
   setSettingsMessage("Connecting...");
@@ -1318,6 +1341,7 @@ $("#connect-model-endpoint").addEventListener("click", async () => {
     const contextWindow = selectedModelContextWindow(models, selected);
     if (contextWindow) $("#setting-context-window").value = contextWindow;
     $("#setting-reasoning-control").value = result.reasoning_control || "auto";
+    setSupportedModalities(result.supported_modalities || []);
     setSettingsMessage(`Connected. Reasoning control: ${result.reasoning_control || "auto"}.`);
   } catch (error) {
     setSettingsMessage(error.message, true);

@@ -354,6 +354,7 @@ def default_model_settings() -> dict[str, Any]:
         "temperature": 0.2,
         "reasoning_enabled": False,
         "reasoning_control": "auto",
+        "supported_modalities": [],
         "context_window_tokens": 32768,
         "timeout_seconds": 600,
     }
@@ -420,6 +421,11 @@ class ModelSettingsStore:
         current["temperature"] = float(current["temperature"])
         current["reasoning_enabled"] = bool(current["reasoning_enabled"])
         current["reasoning_control"] = str(current.get("reasoning_control") or "auto")
+        modalities = current.get("supported_modalities", [])
+        if isinstance(modalities, list):
+            current["supported_modalities"] = sorted({str(item).strip().lower() for item in modalities if str(item).strip()})
+        else:
+            current["supported_modalities"] = []
         current["context_window_tokens"] = max(1, int(current["context_window_tokens"]))
         current["timeout_seconds"] = max(1, int(current["timeout_seconds"]))
         return current
@@ -506,13 +512,15 @@ def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
         if model.get("id") or model.get("name") or model.get("model")
     ]
     reasoning_control = detect_reasoning_control(endpoint_url, normalized)
+    supported_modalities = ["text"]
     if reasoning_control == "ollama":
         merge_ollama_loaded_context(endpoint_url, normalized, timeout=timeout)
     if is_llamacpp_endpoint(normalized):
-        merge_llamacpp_props_context(endpoint_url, normalized, timeout=timeout)
+        supported_modalities = merge_llamacpp_props_context(endpoint_url, normalized, timeout=timeout)
     return {
         "models": normalized,
         "reasoning_control": reasoning_control,
+        "supported_modalities": supported_modalities,
     }
 
 
@@ -541,7 +549,7 @@ def merge_ollama_loaded_context(endpoint_url: str, models: list[dict[str, Any]],
             model["context_window_tokens"] = context_length
 
 
-def merge_llamacpp_props_context(endpoint_url: str, models: list[dict[str, Any]], timeout: int = 10) -> None:
+def merge_llamacpp_props_context(endpoint_url: str, models: list[dict[str, Any]], timeout: int = 10) -> list[str]:
     endpoint = normalize_endpoint_url(endpoint_url)
     parsed = urllib.parse.urlparse(endpoint)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -551,17 +559,25 @@ def merge_llamacpp_props_context(endpoint_url: str, models: list[dict[str, Any]]
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return
+        return ["text"]
+    supported_modalities = {"text"}
+    modalities = data.get("modalities", {})
+    if isinstance(modalities, dict):
+        supported_modalities.update(
+            str(name).strip().lower()
+            for name, enabled in modalities.items()
+            if enabled and str(name).strip()
+        )
     settings = data.get("default_generation_settings", {})
     if not isinstance(settings, dict):
-        return
+        return sorted(supported_modalities)
     context_length = settings.get("n_ctx")
     if not context_length:
         context_length = (settings.get("params") or {}).get("n_ctx") if isinstance(settings.get("params"), dict) else None
-    if not context_length:
-        return
-    for model in models:
-        model["context_window_tokens"] = context_length
+    if context_length:
+        for model in models:
+            model["context_window_tokens"] = context_length
+    return sorted(supported_modalities)
 
 
 def estimate_tokens(value: Any) -> int:
@@ -617,14 +633,21 @@ def truncate_transcript_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def artifact_roots(project_state: "ProjectState") -> list[tuple[Path, str]]:
+    return [
+        (project_state.plots_dir, "plot"),
+        (project_state.results_dir, "result"),
+    ]
+
+
 def context_token_breakdown(payload: dict[str, Any]) -> dict[str, int]:
     return {
-        "durable_code": estimate_tokens(payload.get("durable_code", "")),
+        "workspace": estimate_tokens(payload.get("workspace", {})),
         "session_summary": estimate_tokens(payload.get("session_summary", "")),
-        "recent_chat": estimate_tokens(payload.get("recent_chat", [])),
-        "recent_transcript": estimate_tokens(payload.get("recent_transcript", [])),
-        "artifacts": estimate_tokens(payload.get("artifacts", {})),
-        "environment": estimate_tokens(payload.get("environment", {})),
+        "recent_events": estimate_tokens(payload.get("recent_events", [])),
+        "durable_code": estimate_tokens(payload.get("durable_code", "")),
+        "artifact_ledger": estimate_tokens(payload.get("artifact_ledger", [])),
+        "action_feedback": estimate_tokens(payload.get("action_feedback", "")),
     }
 
 
@@ -741,6 +764,84 @@ class ArtifactStore:
             return str(path.resolve().relative_to(self.root))
         except ValueError:
             return str(path)
+
+    def file_snapshot(self, roots: list[tuple[Path, str]]) -> dict[str, tuple[str, int, int]]:
+        snapshot: dict[str, tuple[str, int, int]] = {}
+        for root, artifact_type in roots:
+            resolved_root = root.resolve()
+            if not resolved_root.exists():
+                continue
+            for path in resolved_root.rglob("*"):
+                resolved = path.resolve()
+                if path.is_symlink() or not path.is_file() or not resolved.is_relative_to(resolved_root):
+                    continue
+                if path.name in {".DS_Store", "Thumbs.db"}:
+                    continue
+                stat = path.stat()
+                snapshot[self.display_path(path)] = (artifact_type, stat.st_size, stat.st_mtime_ns)
+        return snapshot
+
+    def sync_paths(self, roots: list[tuple[Path, str]], *, source: str = "session") -> list[dict[str, Any]]:
+        entries = self.list()
+        entries_by_path = {str(entry.get("path", "")): entry for entry in entries}
+        managed_roots = [root.resolve() for root, _artifact_type in roots]
+        current_snapshot = self.file_snapshot(roots)
+        current_paths = set(current_snapshot)
+        next_id = max([int(entry["id"]) for entry in entries if "id" in entry], default=0) + 1
+        now = utc_now_iso()
+        synced_by_path: dict[str, dict[str, Any]] = {}
+
+        for display_path, (artifact_type, size_bytes, mtime_ns) in sorted(current_snapshot.items()):
+            existing = entries_by_path.get(display_path)
+            caption = Path(display_path).name
+            try:
+                existing_size = int(existing.get("size_bytes", -1)) if existing else -1
+            except (TypeError, ValueError):
+                existing_size = -1
+            if (
+                existing
+                and existing.get("type") == artifact_type
+                and existing_size == size_bytes
+                and str(existing.get("mtime_ns", "")) == str(mtime_ns)
+                and existing.get("caption") == caption
+            ):
+                synced_by_path[display_path] = existing
+                continue
+
+            synced_by_path[display_path] = {
+                "id": int(existing["id"]) if existing and "id" in existing else next_id,
+                "type": artifact_type,
+                "path": display_path,
+                "created_at": now,
+                "source": source,
+                "caption": caption,
+                "pinned": bool(existing.get("pinned")) if existing else False,
+                "size_bytes": size_bytes,
+                "mtime_ns": str(mtime_ns),
+            }
+            if not existing:
+                next_id += 1
+
+        kept: list[dict[str, Any]] = []
+        for entry in entries:
+            path_value = str(entry.get("path", ""))
+            resolved = (self.root / path_value).resolve()
+            is_managed = any(resolved.is_relative_to(root) for root in managed_roots)
+            if is_managed:
+                if path_value in current_paths and path_value not in {item.get("path") for item in kept}:
+                    kept.append(synced_by_path[path_value])
+                continue
+            kept.append(entry)
+
+        known_paths = {str(entry.get("path", "")) for entry in kept}
+        for display_path in sorted(current_paths - known_paths):
+            kept.append(synced_by_path[display_path])
+
+        self.path.write_text(
+            "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in kept),
+            encoding="utf-8",
+        )
+        return kept
 
     def upsert_path(
         self,
@@ -921,14 +1022,14 @@ class PythonSession:
         job_id = self.active_jobs.begin(kind="session", language=self.language, source=source, input_text=code)
         start = time.perf_counter()
         try:
-            before_pngs = self._png_snapshot()
+            before_artifacts = self.artifacts.file_snapshot(artifact_roots(self.project))
             response = self._send_worker_request(
                 {
                     "code": code,
                     "interactive": interactive,
                 }
             )
-            generated_artifacts = self._record_changed_png_artifacts(before_pngs)
+            generated_artifacts = self._record_changed_artifacts(before_artifacts)
             duration_ms = int((time.perf_counter() - start) * 1000)
             entry = self.transcript.append_session(
                 language=self.language,
@@ -944,37 +1045,12 @@ class PythonSession:
         finally:
             self.active_jobs.finish(job_id)
 
-    def _png_snapshot(self) -> dict[Path, tuple[int, int]]:
-        snapshot: dict[Path, tuple[int, int]] = {}
-        root = self.project.plots_dir.resolve()
-        if not root.exists():
-            return snapshot
-        for path in root.rglob("*"):
-            if path.suffix.lower() != ".png" or not path.is_file():
-                continue
-            resolved = path.resolve()
-            stat = resolved.stat()
-            snapshot[resolved] = (stat.st_mtime_ns, stat.st_size)
-        return snapshot
-
-    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]]) -> list[dict[str, Any]]:
-        after = self._png_snapshot()
-        changed_paths = [
-            path
-            for path, signature in after.items()
-            if before.get(path) != signature
-        ]
-        generated = []
-        for path in sorted(changed_paths):
-            generated.append(
-                self.artifacts.upsert_path(
-                    artifact_type="plot",
-                    path=path,
-                    source="session",
-                    caption=path.name,
-                )
-            )
-        return generated
+    def _record_changed_artifacts(self, before: dict[str, tuple[str, int, int]]) -> list[dict[str, Any]]:
+        roots = artifact_roots(self.project)
+        after = self.artifacts.file_snapshot(roots)
+        changed_paths = {path for path, signature in after.items() if before.get(path) != signature}
+        entries = self.artifacts.sync_paths(roots)
+        return [entry for entry in entries if str(entry.get("path", "")) in changed_paths]
 
     def _send_worker_request(self, request: dict[str, Any]) -> dict[str, Any]:
         process = self._ensure_worker()
@@ -1048,14 +1124,14 @@ class RSession:
         job_id = self.active_jobs.begin(kind="session", language=self.language, source=source, input_text=code)
         start = time.perf_counter()
         try:
-            before_pngs = self._png_snapshot()
+            before_artifacts = self.artifacts.file_snapshot(artifact_roots(self.project))
             response = self._send_worker_request(
                 {
                     "code": code,
                     "interactive": interactive,
                 }
             )
-            generated_artifacts = self._record_changed_png_artifacts(before_pngs)
+            generated_artifacts = self._record_changed_artifacts(before_artifacts)
             duration_ms = int((time.perf_counter() - start) * 1000)
             entry = self.transcript.append_session(
                 language=self.language,
@@ -1071,37 +1147,12 @@ class RSession:
         finally:
             self.active_jobs.finish(job_id)
 
-    def _png_snapshot(self) -> dict[Path, tuple[int, int]]:
-        snapshot: dict[Path, tuple[int, int]] = {}
-        root = self.project.plots_dir.resolve()
-        if not root.exists():
-            return snapshot
-        for path in root.rglob("*"):
-            if path.suffix.lower() != ".png" or not path.is_file():
-                continue
-            resolved = path.resolve()
-            stat = resolved.stat()
-            snapshot[resolved] = (stat.st_mtime_ns, stat.st_size)
-        return snapshot
-
-    def _record_changed_png_artifacts(self, before: dict[Path, tuple[int, int]]) -> list[dict[str, Any]]:
-        after = self._png_snapshot()
-        changed_paths = [
-            path
-            for path, signature in after.items()
-            if before.get(path) != signature
-        ]
-        generated = []
-        for path in sorted(changed_paths):
-            generated.append(
-                self.artifacts.upsert_path(
-                    artifact_type="plot",
-                    path=path,
-                    source="session",
-                    caption=path.name,
-                )
-            )
-        return generated
+    def _record_changed_artifacts(self, before: dict[str, tuple[str, int, int]]) -> list[dict[str, Any]]:
+        roots = artifact_roots(self.project)
+        after = self.artifacts.file_snapshot(roots)
+        changed_paths = {path for path, signature in after.items() if before.get(path) != signature}
+        entries = self.artifacts.sync_paths(roots)
+        return [entry for entry in entries if str(entry.get("path", "")) in changed_paths]
 
     def _send_worker_request(self, request: dict[str, Any]) -> dict[str, Any]:
         process = self._ensure_worker()
@@ -1117,9 +1168,17 @@ class RSession:
         return json.loads(line)
 
 class ShellSession:
-    def __init__(self, project: ProjectState, transcript: TranscriptStore, active_jobs: ActiveJobStore, cwd: Path) -> None:
+    def __init__(
+        self,
+        project: ProjectState,
+        transcript: TranscriptStore,
+        artifacts: ArtifactStore,
+        active_jobs: ActiveJobStore,
+        cwd: Path,
+    ) -> None:
         self.project = project
         self.transcript = transcript
+        self.artifacts = artifacts
         self.active_jobs = active_jobs
         self.cwd = cwd
 
@@ -1134,6 +1193,7 @@ class ShellSession:
             env.pop("PYTHONHOME", None)
         start = time.perf_counter()
         try:
+            before_artifacts = self.artifacts.file_snapshot(artifact_roots(self.project))
             completed = subprocess.run(
                 command,
                 shell=True,
@@ -1144,8 +1204,9 @@ class ShellSession:
                 timeout=120,
                 executable="/bin/bash",
             )
+            generated_artifacts = self._record_changed_artifacts(before_artifacts)
             duration_ms = int((time.perf_counter() - start) * 1000)
-            return self.transcript.append_shell(
+            entry = self.transcript.append_shell(
                 source=source,
                 command=command,
                 stdout=completed.stdout,
@@ -1155,8 +1216,16 @@ class ShellSession:
                 duration_ms=duration_ms,
                 cwd=self.cwd,
             )
+            return {"entry": entry, "artifacts": generated_artifacts}
         finally:
             self.active_jobs.finish(job_id)
+
+    def _record_changed_artifacts(self, before: dict[str, tuple[str, int, int]]) -> list[dict[str, Any]]:
+        roots = artifact_roots(self.project)
+        after = self.artifacts.file_snapshot(roots)
+        changed_paths = {path for path, signature in after.items() if before.get(path) != signature}
+        entries = self.artifacts.sync_paths(roots, source="shell")
+        return [entry for entry in entries if str(entry.get("path", "")) in changed_paths]
 
 
 class ContextBuilder:
@@ -1166,27 +1235,68 @@ class ContextBuilder:
         self.transcript = transcript
         self.artifacts = artifacts
 
-    def payload(self, current_request: str = "") -> dict[str, Any]:
+    def payload(self, current_request: str = "", *, exclude_chat_ids: set[str] | None = None) -> dict[str, Any]:
         code = self.project.source_file.read_text(encoding="utf-8") if self.project.source_file.exists() else ""
         numbered_code = "\n".join(f"{idx:4d}: {line}" for idx, line in enumerate(code.splitlines(), start=1))
-        artifact_entries = self.artifacts.list()
-        environment = self.environment_payload()
-        return {
-            "current_user_request": current_request,
+        payload: dict[str, Any] = {
+            "workspace": self.environment_payload(),
+            "session_summary": self.project.summary_file.read_text(encoding="utf-8"),
             "durable_code": {
                 "path": self.project.source_file.name,
                 "language": self.project.language,
                 "numbered": numbered_code,
             },
-            "session_summary": self.project.summary_file.read_text(encoding="utf-8"),
-            "recent_chat": self.chat.recent(20),
-            "recent_transcript": self.transcript.recent(20),
-            "artifacts": {
-                "recent": artifact_entries[-20:],
-                "pinned": [entry for entry in artifact_entries if entry.get("pinned")],
-            },
-            "environment": environment,
+            "artifact_ledger": self.artifact_ledger(),
+            "recent_events": self.recent_events(exclude_chat_ids=exclude_chat_ids),
         }
+        if current_request:
+            payload["current_request"] = current_request
+        return payload
+
+    def recent_events(self, *, exclude_chat_ids: set[str] | None = None) -> list[dict[str, Any]]:
+        excluded = exclude_chat_ids or set()
+        events: list[dict[str, Any]] = []
+        for entry in self.chat.recent(None):
+            if str(entry.get("id", "")) in excluded:
+                continue
+            event = {
+                "event": "chat_message",
+                "created_at": entry.get("created_at"),
+                "role": entry.get("role"),
+                "content": entry.get("content", ""),
+            }
+            attachments = entry.get("attachments", [])
+            if attachments:
+                event["attachments"] = attachments
+            events.append(event)
+        for entry in self.transcript.recent(None):
+            event = {
+                "event": "execution",
+                "created_at": entry.get("created_at"),
+                "kind": entry.get("kind"),
+                "source": entry.get("source"),
+                "input": entry.get("input", ""),
+                "stdout": entry.get("stdout", ""),
+                "stderr": entry.get("stderr", ""),
+                "ok": entry.get("ok"),
+                "duration_ms": entry.get("duration_ms"),
+            }
+            if entry.get("language"):
+                event["language"] = entry.get("language")
+            if entry.get("artifacts"):
+                event["artifacts"] = entry.get("artifacts")
+            if "exit_code" in entry:
+                event["exit_code"] = entry.get("exit_code")
+            events.append(event)
+        events.sort(key=lambda entry: (str(entry.get("created_at", "")), str(entry.get("event", "")), str(entry.get("role", ""))))
+        return events
+
+    def artifact_ledger(self) -> list[dict[str, Any]]:
+        def sort_key(entry: dict[str, Any]) -> tuple[str, str, str]:
+            type_rank = "0" if entry.get("type") == "plot" else "1"
+            return (type_rank, str(entry.get("created_at", "")), str(entry.get("path", "")))
+
+        return sorted(self.artifacts.list(), key=sort_key)
 
     def environment_payload(self) -> dict[str, Any]:
         if self.project.language == "r":
@@ -1241,9 +1351,14 @@ class AgentService:
             *self._prepare_chat_audio(audio or []),
             *self._save_chat_images(images or []),
         ]
-        self.chat.append("user", message, attachments=self._chat_attachment_metadata(attachments))
+        user_entry = self.chat.append("user", message, attachments=self._chat_attachment_metadata(attachments))
         actions: list[dict[str, Any]] = []
-        assistant = self._request_and_apply(message, action_feedback="", attachments=attachments)
+        assistant = self._request_and_apply(
+            message,
+            action_feedback="",
+            attachments=attachments,
+            exclude_chat_ids={str(user_entry["id"])},
+        )
         pending_actions = assistant["actions"]
         actions.extend(pending_actions)
         followup_count = 0
@@ -1376,6 +1491,7 @@ class AgentService:
         *,
         action_feedback: str,
         attachments: list[dict[str, Any]] | None = None,
+        exclude_chat_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         settings = self.settings.read()
         model = str(settings["model"]).strip()
@@ -1384,7 +1500,7 @@ class AgentService:
             assistant = self.chat.append("system", content)
             return {"message": assistant, "actions": []}
 
-        context = self.context_builder.payload(message)
+        context = self.context_builder.payload(exclude_chat_ids=exclude_chat_ids)
         if action_feedback:
             context["action_feedback"] = action_feedback
         prompt = self._system_prompt(context)
@@ -1478,6 +1594,14 @@ class AgentService:
                 "Save processed output (e.g. TSVs, npz files, report.md) in ./coplot/results/. "
                 "Keep the ./coplot/ folder root clean from artifacts."
             )
+        supported_modalities_value = self.settings.read().get("supported_modalities", [])
+        supported_modalities = supported_modalities_value if isinstance(supported_modalities_value, list) else []
+        audio_guidance = (
+            "If audio is attached to the current user message, listen to it directly. "
+            "Briefly transcribe the spoken instruction and then follow it. "
+            if "audio" in supported_modalities
+            else ""
+        )
         return (
             "You are coplot, an LLM-assisted data science workspace agent. Keep durable code, "
             "session scratch work, shell commands, and artifacts clearly separated. This workspace "
@@ -1497,7 +1621,14 @@ class AgentService:
             f"{runtime_rules} The user will often ask you to visually inspect plots for feedback. "
             "You can only see plots if they have been saved as PNG files in the ./coplot/plots/ folder. "
             "If plot images are attached to the user message, inspect the image directly instead of saying "
-            "you cannot see it.\n\n"
+            "you cannot see it. "
+            f"{audio_guidance}\n\n"
+            "The context payload below is ordered from stable workspace facts toward the newest "
+            "authoritative state. recent_events contains chat and execution events since the "
+            "last context compaction. "
+            "durable_code is the current source of truth for line-numbered edits. "
+            "artifact_ledger is the current authoritative list of files in ./coplot/plots/ "
+            "and ./coplot/results/. The current user request appears after this system message.\n\n"
             f"Context payload:\n{json.dumps(context, ensure_ascii=False)}"
         )
 
@@ -1758,7 +1889,7 @@ def configure_runtime_services() -> None:
     global agent_service
 
     session = create_execution_session(project)
-    shell_session = ShellSession(project, transcript_store, active_job_store, project.root)
+    shell_session = ShellSession(project, transcript_store, artifact_store, active_job_store, project.root)
     context_builder = ContextBuilder(project, chat_store, transcript_store, artifact_store)
     agent_service = AgentService(
         project,
