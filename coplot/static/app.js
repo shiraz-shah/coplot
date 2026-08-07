@@ -387,6 +387,7 @@ function renderModelSettings(settings) {
   $("#setting-timeout").value = settings.timeout_seconds || 600;
   $("#setting-reasoning-enabled").checked = Boolean(settings.reasoning_enabled);
   $("#setting-reasoning-control").value = settings.reasoning_control || "auto";
+  $("#setting-endpoint-kind").value = settings.endpoint_kind || "openai";
   setSupportedModalities(settings.supported_modalities || []);
 }
 
@@ -401,6 +402,7 @@ function readModelSettingsForm() {
     timeout_seconds: Number($("#setting-timeout").value),
     reasoning_enabled: $("#setting-reasoning-enabled").checked,
     reasoning_control: $("#setting-reasoning-control").value || "auto",
+    endpoint_kind: $("#setting-endpoint-kind").value || "openai",
     supported_modalities: readSupportedModalities(),
   };
 }
@@ -1323,6 +1325,7 @@ $("#close-model-settings").addEventListener("click", () => {
 });
 
 $("#setting-endpoint-url").addEventListener("input", () => {
+  $("#setting-endpoint-kind").value = "openai";
   setSupportedModalities([]);
 });
 
@@ -1341,6 +1344,7 @@ $("#connect-model-endpoint").addEventListener("click", async () => {
     const contextWindow = selectedModelContextWindow(models, selected);
     if (contextWindow) $("#setting-context-window").value = contextWindow;
     $("#setting-reasoning-control").value = result.reasoning_control || "auto";
+    $("#setting-endpoint-kind").value = result.endpoint_kind || "openai";
     setSupportedModalities(result.supported_modalities || []);
     setSettingsMessage(`Connected. Reasoning control: ${result.reasoning_control || "auto"}.`);
   } catch (error) {

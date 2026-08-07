@@ -354,6 +354,7 @@ def default_model_settings() -> dict[str, Any]:
         "temperature": 0.2,
         "reasoning_enabled": False,
         "reasoning_control": "auto",
+        "endpoint_kind": "openai",
         "supported_modalities": [],
         "context_window_tokens": 32768,
         "timeout_seconds": 600,
@@ -421,6 +422,8 @@ class ModelSettingsStore:
         current["temperature"] = float(current["temperature"])
         current["reasoning_enabled"] = bool(current["reasoning_enabled"])
         current["reasoning_control"] = str(current.get("reasoning_control") or "auto")
+        endpoint_kind = str(current.get("endpoint_kind") or "openai").strip().lower()
+        current["endpoint_kind"] = endpoint_kind if endpoint_kind in {"openai", "ollama", "llamacpp", "vllm"} else "openai"
         modalities = current.get("supported_modalities", [])
         if isinstance(modalities, list):
             current["supported_modalities"] = sorted({str(item).strip().lower() for item in modalities if str(item).strip()})
@@ -513,13 +516,16 @@ def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
     ]
     reasoning_control = detect_reasoning_control(endpoint_url, normalized)
     supported_modalities = ["text"]
+    endpoint_kind = "llamacpp" if is_llamacpp_endpoint(normalized) else "openai"
     if reasoning_control == "ollama":
+        endpoint_kind = "ollama"
         merge_ollama_loaded_context(endpoint_url, normalized, timeout=timeout)
     if is_llamacpp_endpoint(normalized):
         supported_modalities = merge_llamacpp_props_context(endpoint_url, normalized, timeout=timeout)
     return {
         "models": normalized,
         "reasoning_control": reasoning_control,
+        "endpoint_kind": endpoint_kind,
         "supported_modalities": supported_modalities,
     }
 
@@ -1403,6 +1409,7 @@ class AgentService:
             "stream": False,
         }
         self._apply_reasoning_settings(payload, settings)
+        self._apply_endpoint_settings(payload, settings)
         request = urllib.request.Request(
             self.settings.request_url(),
             data=json.dumps(payload).encode("utf-8"),
@@ -1517,6 +1524,7 @@ class AgentService:
             "stream": False,
         }
         self._apply_reasoning_settings(payload, settings)
+        self._apply_endpoint_settings(payload, settings)
         request = urllib.request.Request(
             self.settings.request_url(),
             data=json.dumps(payload).encode("utf-8"),
@@ -1687,6 +1695,11 @@ class AgentService:
             return
         if control == "chat_template_kwargs":
             payload["chat_template_kwargs"] = {"enable_thinking": reasoning_enabled}
+
+    def _apply_endpoint_settings(self, payload: dict[str, Any], settings: dict[str, Any]) -> None:
+        if str(settings.get("endpoint_kind") or "").strip().lower() == "llamacpp":
+            payload["cache_prompt"] = True
+            payload["id_slot"] = 0
 
     def _user_content(self, message: str, *, attachments: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
         if attachments:
