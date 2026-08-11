@@ -588,7 +588,7 @@ def merge_llamacpp_props_context(endpoint_url: str, models: list[dict[str, Any]]
 
 def estimate_tokens(value: Any) -> int:
     text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-    return max(1, int(len(text) / 4))
+    return max(1, int(len(text) / 3))
 
 
 def utf8_len(text: str) -> int:
@@ -2078,7 +2078,10 @@ class Handler(SimpleHTTPRequestHandler):
         context_payload = context_builder.payload()
         estimated_context_tokens = estimate_tokens(context_payload)
         context_breakdown = context_token_breakdown(context_payload)
-        context_window_tokens = int(model_settings_store.read().get("context_window_tokens", 32768))
+        settings = model_settings_store.read()
+        context_window_tokens = int(settings.get("context_window_tokens", 32768))
+        max_output_tokens = int(settings.get("max_tokens", 1))
+        estimated_total_tokens = estimated_context_tokens + max_output_tokens
         return {
             "project": {
                 "root": str(project.root),
@@ -2101,11 +2104,13 @@ class Handler(SimpleHTTPRequestHandler):
             "transcript": transcript_store.recent(100),
             "active_jobs": active_job_store.list(),
             "artifacts": artifact_store.list(),
-            "model_settings": model_settings_store.read(),
+            "model_settings": settings,
             "context_usage": {
-                "estimated_tokens": estimated_context_tokens,
+                "estimated_tokens": estimated_total_tokens,
+                "estimated_input_tokens": estimated_context_tokens,
+                "reserved_output_tokens": max_output_tokens,
                 "limit_tokens": context_window_tokens,
-                "percent": min(100, round((estimated_context_tokens / context_window_tokens) * 100)),
+                "percent": min(100, round((estimated_total_tokens / context_window_tokens) * 100)),
                 "breakdown": context_breakdown,
             },
         }

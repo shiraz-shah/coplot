@@ -106,7 +106,9 @@ function renderContextMeter(usage) {
   element.textContent = `context ~${estimated}k/${limit}k (${usage.percent || 0}%)`;
   const breakdown = usage.breakdown || {};
   element.title = [
-    "Approximate context size sent with the next model request.",
+    "Approximate input context plus reserved output tokens.",
+    `input: ~${Math.round((usage.estimated_input_tokens || 0) / 100) / 10}k`,
+    `reserved output: ~${Math.round((usage.reserved_output_tokens || 0) / 100) / 10}k`,
     `workspace: ~${Math.round((breakdown.workspace || 0) / 100) / 10}k`,
     `summary: ~${Math.round((breakdown.session_summary || 0) / 100) / 10}k`,
     `events: ~${Math.round((breakdown.recent_events || 0) / 100) / 10}k`,
