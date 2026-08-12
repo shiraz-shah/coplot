@@ -1753,20 +1753,7 @@ class AgentService:
         return f"data:image/png;base64,{encoded}"
 
     def _image_artifacts_for_message(self, message: str) -> list[dict[str, Any]]:
-        lowered = message.lower()
-        visual_terms = {
-            "plot",
-            "image",
-            "png",
-            "figure",
-            "chart",
-            "graph",
-            "visual",
-            "look at",
-            "see it",
-            "inspect",
-        }
-        if not any(term in lowered for term in visual_terms):
+        if not re.search(r"\b[Ll]ook at the plot\b", message):
             return []
         plots = [entry for entry in artifact_store.list() if entry.get("type") == "plot"]
         plots.sort(key=lambda entry: (str(entry.get("created_at", "")), str(entry.get("path", ""))))
