@@ -118,6 +118,53 @@ The app creates local workspace files in your project folder. Dependencies are p
 - `coplot/chat_images/venv` or `renv` - holds project dependencies
 - `coplot_YYYYMMDD-HHMMSS.zip` - session archives that contain all of the above except the dependencies.
 
+## Model serving for prompt caching
+Coplot sends the stable parts of the prompt first so local inference servers can reuse cached prompt/KV state across chat turns. Good server settings matter a lot for long sessions.
+
+- vLLM
+  - Start with `--enable-prefix-caching` explicitly, even if your vLLM version enables it by default.
+  - Give the KV cache enough room with `--gpu-memory-utilization`, e.g. `0.90` or higher if your GPU has headroom.
+  - Enable/inspect metrics and watch prefix cache hit/query counters if performance is unclear.
+  - Example:
+    ```bash
+    vllm serve Qwen/Qwen3.6-30B-A3B \
+      --host 0.0.0.0 \
+      --port 8000 \
+      --enable-prefix-caching \
+      --gpu-memory-utilization 0.90
+    ```
+
+- llama.cpp
+  - Prompt caching is enabled by default, but `--cache-prompt` makes the intention explicit.
+  - Coplot pins llama.cpp requests to `id_slot: 0`, so avoid sharing slot 0 with other clients. For a dedicated Coplot server, `-np 1` is simplest.
+  - If using multiple slots, e.g. `-np 2`, make sure slot 0 is available for Coplot.
+  - Keep enough RAM prompt cache. Use `--cache-ram 32768` or `--cache-ram -1` for testing. Do not use `--cache-ram 0`.
+  - For long contexts, raise context checkpoints. `--ctx-checkpoints 128` is a good starting point.
+  - If logs say `making room for prompt cache entry`, raise `--cache-ram`. If logs say `cache token limit ... reached`, raise `--ctx-checkpoints`.
+  - Example:
+    ```bash
+    llama-server \
+      -m /path/to/model.gguf \
+      --host 0.0.0.0 \
+      --port 8000 \
+      -np 1 \
+      --ctx-size 65536 \
+      --cache-prompt \
+      --cache-ram 32768 \
+      --ctx-checkpoints 128 \
+      --metrics
+    ```
+
+- Ollama
+  - Ollama is the easiest backend to run, but it exposes fewer prompt-cache controls than vLLM or llama.cpp.
+  - Use a large enough context length for Coplot sessions, e.g. `OLLAMA_CONTEXT_LENGTH=64000`.
+  - Keep the model loaded between turns with `OLLAMA_KEEP_ALIVE=-1` or a long duration.
+  - For best long-context prompt-cache tuning, prefer vLLM or llama.cpp.
+  - Example:
+    ```bash
+    OLLAMA_CONTEXT_LENGTH=64000 OLLAMA_KEEP_ALIVE=-1 ollama serve
+    ```
+
 ## Project Shape
 The current app is intentionally dependency-light:
 - Python standard library HTTP server
