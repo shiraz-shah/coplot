@@ -98,7 +98,7 @@ On the first run, the model settings dialogue opens:
 - Minimum usable context size: 16,384
 
 ## Working with `coplot`
-- The LLM sees your code, Python/R and Shell output and your last plot
+- The LLM sees your code, Python/R and Shell output and you can tell it to "look at the plot" too
 - The LLM often prefers one-off code execution in the terminal instead of editing and running code file
 - Ask it to "remember to update the code" to make it add reproducible to `coplot.R` or `.py`
 - Paste screenshots into the chat and ask it to reproduce a plot you've seen elsewhere
