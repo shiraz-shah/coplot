@@ -123,16 +123,16 @@ Proper prompt caching dramatically speeds up the time coplot takes to respond. C
 
 ### `llama.cpp`
 To get chaching woking properly with `llama.cpp`, the following server options help:
-    ```bash
-    llama-server \
-      -m /path/to/model.gguf \
-      --ctx-size 131072 \
-      ...                         # all your custom options
-      -np 1 \                     # disabling parallelism keeps cache clean
-      --cache-ram 32768 \         # megabytes of system RAM you have available
-      --ctx-checkpoints 256 \     # number of checkpoints that fit in above MBs
-      --cache-type-k kvarn4 --cache-type-v kvarn4 \ # supported by beellama.cpp
-    ```
+```bash
+llama-server \
+-m /path/to/model.gguf \
+--ctx-size 131072 \
+...                         # all your custom options
+-np 1 \                     # disabling parallelism keeps cache clean
+--cache-ram 32768 \         # megabytes of system RAM you have available
+--ctx-checkpoints 256 \     # number of checkpoints that fit in above MBs
+--cache-type-k kvarn4 --cache-type-v kvarn4 \ # supported by beellama.cpp
+```
 
 ### Ollama
 Ollama is easy to install but hard to tweak. The following may help:
