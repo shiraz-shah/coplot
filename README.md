@@ -119,10 +119,10 @@ The app creates local workspace files in your project folder. Dependencies are p
 - `coplot_YYYYMMDD-HHMMSS.zip` - session archives that contain all of the above except the dependencies.
 
 ## Speeding up coplot's response time
-Proper prompt caching dramatically speeds up the time coplot takes to respond. Caching normally works out of the box if your LLM is served with vLLM.
+Proper prompt caching dramatically speeds up the time coplot takes to respond. Caching happens on your local LLM server. With vLLM it works out of the box.
 
 ### `llama.cpp`
-To get chaching woking properly with `llama.cpp`, the following server options help:
+To get caching woking properly with `llama.cpp`, the following server options help:
 ```bash
 llama-server \
 -m /path/to/model.gguf \
