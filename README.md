@@ -98,11 +98,11 @@ On the first run, the model settings dialogue opens:
 - Minimum usable context size: 16,384
 
 ## Working with `coplot`
-- The LLM sees your code, Python/R and Shell output and you can tell it to "look at the plot" too
+- The LLM sees your code and Python/R and Shell output, and can request PNGs from `coplot/plots/` for visual inspection using `coplot-view`.
 - The LLM often prefers one-off code execution in the terminal instead of editing and running code file
 - Ask it to "remember to update the code" to make it add reproducible to `coplot.R` or `.py`
 - Paste screenshots into the chat and ask it to reproduce a plot you've seen elsewhere
-- The LLM can act independently for max four turns before user input is a must
+- The LLM can act independently for up to 20 model turns by default; change Max agent turns in settings. Budget exhaustion and repeated action failures are reported in chat.
 - Just say "proceed" if it wasn't finished with what it was doing
 - LLM responses can get slow when the context counter is +32k. Compact context often using top right button
 - `coplot` is best for exploration. It does not have the bells and whistles of a daily driver IDE

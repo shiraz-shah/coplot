@@ -143,7 +143,7 @@ function renderChat(entries) {
     item.innerHTML = `
       <div class="label">${escapeHtml(entry.role)}</div>
       ${attachmentsHtml}
-      <div class="content">${formatMarkdownLite(entry.content)}</div>
+      <div class="content">${formatMarkdownLite(entry.content, entry.actions)}</div>
     `;
     log.appendChild(item);
   }
@@ -387,6 +387,7 @@ function renderModelSettings(settings) {
   $("#setting-context-window").value = settings.context_window_tokens || 32768;
   $("#setting-temperature").value = settings.temperature ?? 0.2;
   $("#setting-timeout").value = settings.timeout_seconds || 600;
+  $("#setting-max-agent-turns").value = settings.max_agent_turns || 20;
   $("#setting-reasoning-enabled").checked = Boolean(settings.reasoning_enabled);
   $("#setting-reasoning-control").value = settings.reasoning_control || "auto";
   $("#setting-endpoint-kind").value = settings.endpoint_kind || "openai";
@@ -402,6 +403,7 @@ function readModelSettingsForm() {
     context_window_tokens: Number($("#setting-context-window").value),
     temperature: Number($("#setting-temperature").value),
     timeout_seconds: Number($("#setting-timeout").value),
+    max_agent_turns: Number($("#setting-max-agent-turns").value),
     reasoning_enabled: $("#setting-reasoning-enabled").checked,
     reasoning_control: $("#setting-reasoning-control").value || "auto",
     endpoint_kind: $("#setting-endpoint-kind").value || "openai",
@@ -536,7 +538,7 @@ function formatArtifactMeta(artifact) {
     .join("");
 }
 
-function formatMarkdownLite(value) {
+function formatMarkdownLite(value, actions = null) {
   let html = escapeHtml(value);
   const blocks = [];
   const protectBlock = (markup) => {
@@ -544,9 +546,17 @@ function formatMarkdownLite(value) {
     blocks.push(markup);
     return token;
   };
-  html = html.replace(/```coplot-edit[\s\S]*?```/gi, () => protectBlock('<div class="action-note">Applied editor update</div>'));
-  html = html.replace(/```coplot-run[\s\S]*?```/gi, () => protectBlock('<div class="action-note">Ran session scratch code</div>'));
-  html = html.replace(/```coplot-shell[\s\S]*?```/gi, () => protectBlock('<div class="action-note">Ran shell command</div>'));
+  const counts = {};
+  const actionTypes = { edit: "edit_file", run: "execute_session", shell: "execute_shell", view: "view_image" };
+  const labels = { edit: "Editor update", run: "Session execution", shell: "Shell execution", view: "Plot inspection" };
+  html = html.replace(/```coplot-(edit|run|shell|view)[ \t]*\r?\n[\s\S]*?^[ \t]*```[ \t]*\r?$/gim, (_, name) => {
+    const kind = name.toLowerCase();
+    const index = counts[kind] || 0;
+    counts[kind] = index + 1;
+    const action = actions?.filter((item) => item.type === actionTypes[kind])[index];
+    const status = action?.status || (actions ? "not executed" : "requested");
+    return protectBlock(`<div class="action-note">${labels[kind]}: ${escapeHtml(status)}</div>`);
+  });
   html = html.replace(/```([\s\S]*?)```/g, (_, code) => protectBlock(`<pre class="output">${code}</pre>`));
   html = formatMarkdownBlocks(html);
   return html.replace(/@@COPLOT_BLOCK_(\d+)@@/g, (_, index) => blocks[Number(index)] || "");

@@ -118,6 +118,7 @@ Keep the generic action fence names:
 coplot-edit  -> edits coplot.py or coplot.R, depending on workspace language
 coplot-run   -> runs code in the persistent selected-language session
 coplot-shell -> runs shell commands from the workspace root
+coplot-view  -> requests PNGs from coplot/plots/ for the next model turn
 ```
 
 Edit block format is a JSON list of line edits:
@@ -150,12 +151,47 @@ python -m pip show pandas
 ```
 ````
 
+View block format:
+
+````text
+```coplot-view
+{"paths": ["coplot/plots/scatter.png"]}
+```
+````
+
+View actions accept up to four PNGs per model turn, at most 20 MiB each.
+Resolved paths must stay within `coplot/plots/`, including symlink targets.
+The next follow-up attaches the pixels once, with filenames/status/errors in
+action feedback. Later turns do not retain image bytes. The former
+"look at the plot" phrase trigger is removed; the model chooses images through
+`coplot-view`. Failed view actions get follow-up feedback so the model can repair
+the request. The model budget defaults to 20 total turns per user request and
+is configurable through `max_agent_turns` in workspace/global settings.
+
+The system context order is workspace, session_summary, recent_events,
+artifact_ledger, action_feedback (when present), then durable_code. The code
+snapshot carries the description "Current state of the durable code". Prompt
+guidance encourages exploration and retaining useful analysis without requiring
+every scratch execution to become durable code.
+
+Actions execute in response order. Stop is checked between actions. Malformed
+or XML action syntax prevents execution of that response and gets at most two
+format repair attempts. Execution/edit/view failures get explicit feedback;
+dependent later actions in the same response are skipped. Three identical
+consecutive failures stop the loop. Output-token truncation prevents all action
+execution for that response. Assistant chat records include finish reason,
+usage, response message fields, and actual action statuses for diagnostics and
+UI rendering. HTTP errors include the server's response body.
+
+SGLang is detected through owned_by and its /get_model_info endpoint supplies
+image/audio capability flags. Missing optional metadata falls back to text.
+
 Prompt rules to preserve:
 
 - durable edits go to `coplot.py` in Python mode or `coplot.R` in R mode
 - scratch code goes through `coplot-run`
-- use `coplot-run` freely for exploration, but whenever code creates useful
-  analysis state, also update the durable source with `coplot-edit`
+- use `coplot-run` freely for exploration; durable code captures analysis worth
+  retaining and reproducing
 - shell is for package/system/file checks
 - Python packages should be installed into `coplot/venv/`
 - R packages should be installed with `renv::install(...)`; prefer GitHub
@@ -282,10 +318,21 @@ Replacing the editor with CodeMirror or Monaco remains a good future upgrade.
 Basic checks:
 
 ```bash
+PYTHONPYCACHEPREFIX=/private/tmp/coplot-pycache python3 -m unittest discover -s tests -v
 PYTHONPYCACHEPREFIX=/private/tmp/coplot-pycache python3 -m py_compile coplot/server.py coplot/session_worker.py coplot/__main__.py coplot/__init__.py
 node --check coplot/static/app.js
 Rscript --vanilla -e "invisible(parse('coplot/r_session_worker.R')); cat('ok\n')"
 python3 -m coplot --help
+```
+
+Optional live SGLang compatibility checks use disposable Python workspaces and
+synthetic data only. They exercise six independent execution turns, recovery
+from a Python error, durable edits with quoted/multiline content, and image
+inspection with thinking off/on. Raw requests/responses are saved to the
+selected output file:
+
+```bash
+python3 tests/sglang_smoke.py --endpoint http://localhost:8888 --output /private/tmp/coplot-sglang-smoke.json
 ```
 
 Workspace smoke:

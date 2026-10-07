@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coplot"
-version = "0.1.3"
+version = "0.2.0"
 description = "Local web workspace for LLM-assisted data science."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -31,9 +31,10 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULTS_FILE = Path(os.environ.get("COPLOT_DEFAULTS_FILE", Path.home() / ".config" / "coplot" / "defaults.json"))
-EDIT_BLOCK_RE = re.compile(r"```coplot-edit[ \t]*\n(?P<json>.*?)```", re.DOTALL | re.IGNORECASE)
-RUN_BLOCK_RE = re.compile(r"```coplot-run[ \t]*\n(?P<code>.*?)```", re.DOTALL | re.IGNORECASE)
-SHELL_BLOCK_RE = re.compile(r"```coplot-shell[ \t]*\n(?P<command>.*?)```", re.DOTALL | re.IGNORECASE)
+ACTION_BLOCK_RE = re.compile(
+    r"```coplot-(?P<kind>edit|run|shell|view)[ \t]*\r?\n(?P<body>.*?)^[ \t]*```[ \t]*\r?$",
+    re.DOTALL | re.IGNORECASE | re.MULTILINE,
+)
 TRANSCRIPT_OUTPUT_LIMIT_BYTES = 8 * 1024
 TRANSCRIPT_OUTPUT_EDGE_BYTES = 4 * 1024
 MAX_CHAT_IMAGE_BYTES = 20 * 1024 * 1024
@@ -79,7 +80,7 @@ workspace_first_run = False
 stop_requested = False
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -358,6 +359,7 @@ def default_model_settings() -> dict[str, Any]:
         "supported_modalities": [],
         "context_window_tokens": 32768,
         "timeout_seconds": 600,
+        "max_agent_turns": 20,
     }
 
 
@@ -423,7 +425,7 @@ class ModelSettingsStore:
         current["reasoning_enabled"] = bool(current["reasoning_enabled"])
         current["reasoning_control"] = str(current.get("reasoning_control") or "auto")
         endpoint_kind = str(current.get("endpoint_kind") or "openai").strip().lower()
-        current["endpoint_kind"] = endpoint_kind if endpoint_kind in {"openai", "ollama", "llamacpp", "vllm"} else "openai"
+        current["endpoint_kind"] = endpoint_kind if endpoint_kind in {"openai", "ollama", "llamacpp", "vllm", "sglang"} else "openai"
         modalities = current.get("supported_modalities", [])
         if isinstance(modalities, list):
             current["supported_modalities"] = sorted({str(item).strip().lower() for item in modalities if str(item).strip()})
@@ -431,6 +433,7 @@ class ModelSettingsStore:
             current["supported_modalities"] = []
         current["context_window_tokens"] = max(1, int(current["context_window_tokens"]))
         current["timeout_seconds"] = max(1, int(current["timeout_seconds"]))
+        current["max_agent_turns"] = max(1, int(current["max_agent_turns"]))
         return current
 
     def request_url(self) -> str:
@@ -472,7 +475,7 @@ def detect_reasoning_control_from_endpoint(endpoint_url: str) -> str:
 def detect_reasoning_control(endpoint_url: str, models: list[dict[str, Any]]) -> str:
     endpoint_guess = detect_reasoning_control_from_endpoint(endpoint_url)
     owners = {str(model.get("owned_by", "")).lower() for model in models}
-    if "vllm" in owners:
+    if owners & {"vllm", "sglang"}:
         return "chat_template_kwargs"
     if "library" in owners:
         return "ollama"
@@ -517,6 +520,12 @@ def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
     reasoning_control = detect_reasoning_control(endpoint_url, normalized)
     supported_modalities = ["text"]
     endpoint_kind = "llamacpp" if is_llamacpp_endpoint(normalized) else "openai"
+    owners = {model["owned_by"].lower() for model in normalized}
+    if "sglang" in owners:
+        endpoint_kind = "sglang"
+        supported_modalities = fetch_sglang_modalities(endpoint_url, timeout)
+    elif "vllm" in owners:
+        endpoint_kind = "vllm"
     if reasoning_control == "ollama":
         endpoint_kind = "ollama"
         merge_ollama_loaded_context(endpoint_url, normalized, timeout=timeout)
@@ -528,6 +537,22 @@ def fetch_models(endpoint_url: str, timeout: int = 10) -> dict[str, Any]:
         "endpoint_kind": endpoint_kind,
         "supported_modalities": supported_modalities,
     }
+
+
+def fetch_sglang_modalities(endpoint_url: str, timeout: int = 10) -> list[str]:
+    base = normalize_endpoint_url(endpoint_url)
+    for suffix in ("/chat/completions", "/v1"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+    request = urllib.request.Request(f"{base}/get_model_info", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            return ["text"]
+        return ["text"] + [name for name in ("image", "audio") if data.get(f"has_{name}_understanding") is True]
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return ["text"]
 
 
 def merge_ollama_loaded_context(endpoint_url: str, models: list[dict[str, Any]], timeout: int = 10) -> None:
@@ -660,28 +685,44 @@ def context_token_breakdown(payload: dict[str, Any]) -> dict[str, int]:
 class ChatStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.lock = threading.RLock()
 
     def replace(self, entries: list[dict[str, Any]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
-            encoding="utf-8",
-        )
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
+                encoding="utf-8",
+            )
 
-    def append(self, role: str, content: str, attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        return append_jsonl(
-            self.path,
-            {
-                "id": str(uuid4()),
-                "created_at": utc_now_iso(),
-                "role": role,
-                "content": str(content),
-                "attachments": attachments or [],
-            },
-        )
+    def append(self, role: str, content: str, attachments: list[dict[str, Any]] | None = None,
+               **metadata: Any) -> dict[str, Any]:
+        with self.lock:
+            return append_jsonl(
+                self.path,
+                {
+                    "id": str(uuid4()),
+                    "created_at": utc_now_iso(),
+                    "role": role,
+                    "content": str(content),
+                    "attachments": attachments or [],
+                    **metadata,
+                },
+            )
+
+    def annotate(self, entry: dict[str, Any], **metadata: Any) -> None:
+        with self.lock:
+            entry.update(metadata)
+            entries = self.recent(None)
+            for stored in entries:
+                if stored["id"] == entry["id"]:
+                    stored.update(metadata)
+                    break
+            self.replace(entries)
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
-        return read_jsonl(self.path, limit)
+        with self.lock:
+            return read_jsonl(self.path, limit)
 
 
 class TranscriptStore:
@@ -1247,13 +1288,14 @@ class ContextBuilder:
         payload: dict[str, Any] = {
             "workspace": self.environment_payload(),
             "session_summary": self.project.summary_file.read_text(encoding="utf-8"),
+            "recent_events": self.recent_events(exclude_chat_ids=exclude_chat_ids),
+            "artifact_ledger": self.artifact_ledger(),
             "durable_code": {
+                "description": "Current state of the durable code",
                 "path": self.project.source_file.name,
                 "language": self.project.language,
                 "numbered": numbered_code,
             },
-            "artifact_ledger": self.artifact_ledger(),
-            "recent_events": self.recent_events(exclude_chat_ids=exclude_chat_ids),
         }
         if current_request:
             payload["current_request"] = current_request
@@ -1368,18 +1410,47 @@ class AgentService:
         pending_actions = assistant["actions"]
         actions.extend(pending_actions)
         followup_count = 0
-        while self._actions_need_followup(pending_actions) and followup_count < 3 and not stop_requested:
+        turn_budget = max(1, int(self.settings.read().get("max_agent_turns", 20)))
+        failure_streak = 0
+        previous_failure = ""
+        protocol_repairs = 0
+        halt_reason = ""
+        while self._actions_need_followup(pending_actions) and not stop_requested:
+            if any(a.get("type") == "protocol_error" for a in pending_actions):
+                protocol_repairs += 1
+                if protocol_repairs > 2:
+                    halt_reason = "Action formatting failed after two repair attempts."
+                    break
+            failed = [a for a in pending_actions if a.get("status") == "failed"]
+            failures = [{"type": a.get("type"), "input": a.get("input"), "error": a.get("error"),
+                         "stderr": a.get("result", {}).get("entry", a.get("result", {})).get("stderr")}
+                        for a in failed]
+            signature = json.dumps(failures, sort_keys=True, ensure_ascii=False) if failures else ""
+            failure_streak = failure_streak + 1 if signature and signature == previous_failure else int(bool(signature))
+            previous_failure = signature
+            if failure_streak >= 3:
+                halt_reason = "Agent stopped after the same action failure occurred three times."
+                break
+            if followup_count + 1 >= turn_budget:
+                halt_reason = f"Agent reached the {turn_budget}-turn limit. Work may remain; ask it to continue or increase Max agent turns in settings."
+                break
             followup_count += 1
+            view_attachments = self._view_attachments(pending_actions)
+            self.chat.annotate(assistant["message"], actions=pending_actions)
             feedback = self._action_feedback(pending_actions)
             assistant = self._request_and_apply(
-                "Continue from the executed action results. If no more action is needed, answer the user.",
+                "Continue from the action results. Repair failed actions using the documented coplot fences; do not repeat successful actions. If no more action is needed, answer the user.",
                 action_feedback=feedback,
+                attachments=view_attachments,
             )
             pending_actions = assistant["actions"]
             actions.extend(pending_actions)
         if stop_requested:
             self.chat.append("system", "Agent stopped by user.")
-        return {"message": assistant["message"], "actions": actions, "stopped": stop_requested}
+        if halt_reason:
+            self.chat.append("system", halt_reason)
+        return {"message": assistant["message"], "actions": actions, "stopped": stop_requested,
+                "turns": followup_count + 1, "halt_reason": halt_reason}
 
     def _chat_attachment_metadata(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         metadata = []
@@ -1512,7 +1583,6 @@ class AgentService:
             context["action_feedback"] = action_feedback
         prompt = self._system_prompt(context)
         user_content = self._user_content(message, attachments=attachments or [])
-        has_audio = self._has_audio_attachments(attachments or [])
         payload = {
             "model": model,
             "messages": [
@@ -1535,16 +1605,37 @@ class AgentService:
             with urllib.request.urlopen(request, timeout=int(settings["timeout_seconds"])) as response:
                 data = json.loads(response.read().decode("utf-8"))
             content = self._extract_chat_text(data)
+            choice = data.get("choices", [{}])[0]
+            diagnostics = {"finish_reason": choice.get("finish_reason"), "usage": data.get("usage", {}),
+                           "message_fields": sorted(k for k, v in choice.get("message", {}).items() if v)}
         except urllib.error.HTTPError as exc:
-            content = "Audio not supported by this endpoint." if has_audio else f"Model request failed: {exc}"
+            detail = exc.read(8192).decode("utf-8", errors="replace")
+            content = f"Model request failed: {exc}. {detail}"
+            diagnostics = {"http_status": exc.code, "error": detail}
         except (urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
             content = f"Model request failed: {exc}"
+            diagnostics = {"error": str(exc)}
 
-        assistant = self.chat.append("assistant", content)
-        actions = self._run_actions(content)
+        assistant = self.chat.append("assistant", content, diagnostics=diagnostics)
+        if diagnostics.get("finish_reason") == "length":
+            actions = []
+            self.chat.append("system", "Model response hit the output token limit. No actions from this response were executed; increase Max tokens and ask it to continue.")
+        elif "error" in diagnostics:
+            actions = []
+        elif "tool_calls" in diagnostics.get("message_fields", []):
+            actions = [{"type": "protocol_error", "status": "failed",
+                        "error": "Native API tool calls are not supported here. No actions executed. Re-issue the action using the documented coplot Markdown fences."}]
+        else:
+            actions = self._run_actions(content)
+        for action in actions:
+            if action.get("type") == "protocol_error":
+                self.chat.append("system", action["error"])
+        self.chat.annotate(assistant, actions=actions)
         return {"message": assistant, "actions": actions}
 
     def _system_prompt(self, context: dict[str, Any]) -> str:
+        order = ("workspace", "session_summary", "recent_events", "artifact_ledger", "action_feedback", "durable_code")
+        context = {key: context[key] for key in order if key in context}
         edit_example = (
             "[{\"start_line\": 1, \"end_line\": 1, \"replacement\": \"print('new code')\\n\"}]"
             if self.project.language == "python"
@@ -1615,6 +1706,8 @@ class AgentService:
             "session scratch work, shell commands, and artifacts clearly separated. This workspace "
             f"is locked to {self.project.language.upper() if self.project.language == 'r' else 'Python'}; "
             "do not switch languages or add language names to coplot action fences.\n\n"
+            "Actions use the coplot Markdown fences shown below. Do not use XML tool_call/function "
+            "tags or invent tools. Execution results and image requests will be returned on your next turn.\n\n"
             "When durable code should change, emit a fenced coplot-edit JSON block for "
             f"{self.project.source_file.name}. The block must be a JSON list of edits using 1-based line "
             "numbers against the current editor contents. end_line is inclusive:\n"
@@ -1623,18 +1716,25 @@ class AgentService:
             "```\n"
             "Use start_line N and end_line 0 to insert before line N. Use start_line 0 "
             "and end_line 0 to insert at the beginning of an empty file. "
-            f"Use coplot-run freely for fast exploration. Once coplot-run gives you the desired result, "
-            f"add durable code to {self.project.source_file.name} with coplot-edit. Remember, the user "
-            f"must be able to get the same result as you by simply running {self.project.source_file.name}. "
-            f"{runtime_rules} The user will often ask you to visually inspect plots for feedback. "
-            "You can only see plots if they have been saved as PNG files in the ./coplot/plots/ folder. "
+            "Use coplot-run freely for exploration. The durable code captures the analysis worth "
+            "retaining and reproducing. "
+            f"{runtime_rules} To visually inspect a PNG in ./coplot/plots/, emit:\n"
+            "```coplot-view\n"
+            '{"paths": ["coplot/plots/scatter.png"]}\n'
+            "```\n"
+            "Use paths from the artifact ledger or PNGs you have saved. You may request up to "
+            "four PNGs per turn. Their pixels will be attached to your next turn, with filenames "
+            "in action_feedback. Wait for that turn before making visual observations. "
+            "Request images when useful for your analysis, including when the user asks you to "
+            "look at a plot. Images are attached only for that turn; request them again if needed. "
             "If plot images are attached to the user message, inspect the image directly instead of saying "
             "you cannot see it. "
             f"{audio_guidance}\n\n"
             "The context payload below is ordered from stable workspace facts toward the newest "
             "authoritative state. recent_events contains chat and execution events since the "
             "last context compaction. "
-            "durable_code is the current source of truth for line-numbered edits. "
+            "durable_code at the end is the current source of truth for line-numbered edits; "
+            "source code mentioned in earlier events may be obsolete. "
             "artifact_ledger is the current authoritative list of files in ./coplot/plots/ "
             "and ./coplot/results/. The current user request appears after this system message.\n\n"
             f"Context payload:\n{json.dumps(context, ensure_ascii=False)}"
@@ -1644,11 +1744,34 @@ class AgentService:
         if not actions:
             return False
         recent = actions[-6:]
-        return any(action.get("type") in {"edit_file", "execute_session", "execute_shell"} for action in recent)
+        return any(action.get("type") in {"edit_file", "execute_session", "execute_shell", "view_image", "protocol_error"} for action in recent)
 
     def _action_feedback(self, actions: list[dict[str, Any]]) -> str:
         chunks = []
-        for action in actions[-6:]:
+        for index, action in enumerate(actions):
+            if index < len(actions) - 6 and action.get("type") != "view_image":
+                continue
+            if action.get("type") == "protocol_error":
+                chunks.append(json.dumps(action, ensure_ascii=False))
+                continue
+            if action.get("type") == "view_image":
+                chunks.append(
+                    json.dumps(
+                        {
+                            "type": "view_image",
+                            "status": action.get("status"),
+                            "paths": action.get("paths", []),
+                            "error": action.get("error"),
+                            "message": (
+                                "Requested PNGs are attached in paths order."
+                                if action.get("status") == "attached"
+                                else "Image request failed; no images attached for this action."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                continue
             if action.get("type") == "edit_file":
                 chunks.append(
                     json.dumps(
@@ -1659,7 +1782,7 @@ class AgentService:
                             "error": action.get("error"),
                             "message": (
                                 f"Edit {action.get('status')} in {self.project.source_file.name}. "
-                                "The updated durable code is now visible in the context payload."
+                                "The current durable code is visible in the context payload."
                             ),
                         },
                         ensure_ascii=False,
@@ -1674,7 +1797,8 @@ class AgentService:
                 json.dumps(
                     {
                         "type": action.get("type"),
-                        "ok": entry.get("ok"),
+                        "ok": entry.get("ok", False),
+                        "error": action.get("error"),
                         "stdout": entry.get("stdout", ""),
                         "stderr": entry.get("stderr", ""),
                         "artifacts": result.get("artifacts", []),
@@ -1722,15 +1846,7 @@ class AgentService:
                     parts.append({"type": "image_url", "image_url": {"url": data_url}})
             return parts if len(parts) > 1 else message
 
-        artifacts = self._image_artifacts_for_message(message)
-        if not artifacts:
-            return message
-        parts = [{"type": "text", "text": message}]
-        for artifact in artifacts:
-            data_url = self._artifact_data_url(artifact)
-            if data_url:
-                parts.append({"type": "image_url", "image_url": {"url": data_url}})
-        return parts if len(parts) > 1 else message
+        return message
 
     def _default_attachment_prompt(self, attachments: list[dict[str, Any]]) -> str:
         if any(attachment.get("type") == "audio" for attachment in attachments):
@@ -1741,6 +1857,8 @@ class AgentService:
         return any(attachment.get("type") == "audio" for attachment in attachments)
 
     def _chat_attachment_data_url(self, attachment: dict[str, Any]) -> str | None:
+        if attachment.get("type") == "plot":
+            return attachment.get("data_url")
         if attachment.get("mime_type") != "image/png":
             return None
         path_value = str(attachment.get("path", ""))
@@ -1752,23 +1870,42 @@ class AgentService:
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
 
-    def _image_artifacts_for_message(self, message: str) -> list[dict[str, Any]]:
-        if not re.search(r"\b[Ll]ook at the plot\b", message):
-            return []
-        plots = [entry for entry in artifact_store.list() if entry.get("type") == "plot"]
-        plots.sort(key=lambda entry: (str(entry.get("created_at", "")), str(entry.get("path", ""))))
-        return plots[-1:] if plots else []
-
-    def _artifact_data_url(self, artifact: dict[str, Any]) -> str | None:
-        path_value = str(artifact.get("path", ""))
-        if not path_value:
-            return None
+    def _plot_image_path(self, path_value: str) -> Path:
         path = (self.project.root / path_value).resolve()
-        if not path.is_file() or not path.is_relative_to(self.project.plots_dir.resolve()):
-            return None
-        mime_type = "image/png" if path.suffix.lower() == ".png" else "application/octet-stream"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:{mime_type};base64,{encoded}"
+        if not path.is_relative_to(self.project.plots_dir.resolve()):
+            raise ValueError("coplot-view paths must be inside coplot/plots/")
+        if path.suffix.lower() != ".png" or not path.is_file():
+            raise ValueError(f"PNG file not found: {path_value}")
+        if path.stat().st_size > MAX_CHAT_IMAGE_BYTES:
+            raise ValueError(f"PNG exceeds the 20 MiB image limit: {path_value}")
+        with path.open("rb") as image:
+            if image.read(8) != b"\x89PNG\r\n\x1a\n":
+                raise ValueError(f"File is not a PNG: {path_value}")
+        return path
+
+    def _view_attachments(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        attachments: list[dict[str, Any]] = []
+        for action in actions:
+            if action.get("type") != "view_image" or action.get("status") != "queued":
+                continue
+            try:
+                pending = []
+                for path_value in action["paths"]:
+                    image = self._plot_image_path(path_value).read_bytes()
+                    pending.append(
+                        {
+                            "type": "plot",
+                            "path": path_value,
+                            "mime_type": "image/png",
+                            "data_url": "data:image/png;base64," + base64.b64encode(image).decode("ascii"),
+                        }
+                    )
+                attachments.extend(pending)
+                action["status"] = "attached"
+            except (OSError, ValueError) as exc:
+                action["status"] = "failed"
+                action["error"] = str(exc)
+        return attachments
 
     def _extract_chat_text(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices", [])
@@ -1790,33 +1927,58 @@ class AgentService:
         )
 
     def _run_actions(self, content: str) -> list[dict[str, Any]]:
-        actions = []
-        for match in EDIT_BLOCK_RE.finditer(content):
-            raw = match.group("json").strip()
-            if not raw:
-                continue
+        matches = list(ACTION_BLOCK_RE.finditer(content))
+        outside = ACTION_BLOCK_RE.sub("", content)
+        if re.search(r"```coplot-", outside, re.IGNORECASE) or re.search(
+            r"<(?:tool_call\b|function=|parameter=)", outside, re.IGNORECASE
+        ):
+            return [{"type": "protocol_error", "status": "failed",
+                     "error": "Malformed or unsupported action format. No actions executed. Re-issue using complete coplot-edit, coplot-run, coplot-shell, or coplot-view Markdown fences; do not use XML."}]
+
+        actions: list[dict[str, Any]] = []
+        view_count = 0
+        for match in matches:
+            if stop_requested:
+                break
+            kind = match.group("kind").lower()
+            raw = match.group("body").strip()
+            action = {"type": {"edit": "edit_file", "run": "execute_session",
+                               "shell": "execute_shell", "view": "view_image"}[kind], "input": raw}
             try:
-                data = json.loads(raw)
-                if not isinstance(data, list):
-                    raise ValueError("coplot-edit block must contain a JSON list")
-                before = self.project.source_file.read_text(encoding="utf-8")
-                selection = selection_for_line_edits(before, data)
-                after = apply_line_edits(before, data)
-                self.project.source_file.write_text(after, encoding="utf-8")
-                actions.append({"type": "edit_file", "status": "applied", "edits": data, "selection": selection})
+                if not raw:
+                    raise ValueError(f"coplot-{kind} block is empty")
+                if kind == "edit":
+                    data = json.loads(raw)
+                    if not isinstance(data, list):
+                        raise ValueError("coplot-edit block must contain a JSON list")
+                    before = self.project.source_file.read_text(encoding="utf-8")
+                    selection = selection_for_line_edits(before, data)
+                    after = apply_line_edits(before, data)
+                    self.project.source_file.write_text(after, encoding="utf-8")
+                    action.update(status="applied", edits=data, selection=selection)
+                elif kind in {"run", "shell"}:
+                    executor = self.session if kind == "run" else self.shell
+                    source = "agent_executed" if kind == "run" else "agent_shell"
+                    result = executor.execute(raw, source=source)
+                    entry = result.get("entry", result)
+                    action.update(status="completed" if entry.get("ok") else "failed", result=result)
+                else:
+                    data = json.loads(raw)
+                    paths = data.get("paths") if isinstance(data, dict) else None
+                    if not isinstance(paths, list) or not paths or any(not isinstance(path, str) or not path.strip() for path in paths):
+                        raise ValueError("coplot-view must contain a nonempty JSON paths list of strings")
+                    if view_count + len(paths) > 4:
+                        raise ValueError("coplot-view supports at most four PNGs per turn")
+                    paths = [str(self._plot_image_path(path).relative_to(self.project.root.resolve())) for path in paths]
+                    action.update(status="queued", paths=paths)
+                    view_count += len(paths)
             except Exception as exc:
-                actions.append({"type": "edit_file", "status": "failed", "error": str(exc), "raw": raw})
-                self.chat.append("system", f"Failed to apply coplot-edit block: {exc}")
-
-        for match in RUN_BLOCK_RE.finditer(content):
-            code = match.group("code").strip()
-            if code:
-                actions.append({"type": "execute_session", "result": self.session.execute(code, source="agent_executed")})
-
-        for match in SHELL_BLOCK_RE.finditer(content):
-            command = match.group("command").strip()
-            if command:
-                actions.append({"type": "execute_shell", "result": self.shell.execute(command, source="agent_shell")})
+                action.update(status="failed", error=str(exc))
+            actions.append(action)
+            if action.get("status") == "failed":
+                self.chat.append("system", f"Failed coplot-{kind} action: {action.get('error') or 'execution failed; see transcript output'}")
+                # Later actions may depend on the failed action. Retry with fresh results.
+                break
         return actions
 
 

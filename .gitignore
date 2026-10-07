@@ -1,4 +1,5 @@
 # Local coplot workspace state
+/test/
 .agent-data/
 coplot_data/
 plots/
